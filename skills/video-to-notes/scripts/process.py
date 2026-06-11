@@ -150,7 +150,12 @@ def probe_video(url: str) -> dict:
         print("❌ 未安装 yt-dlp")
         sys.exit(1)
 
-    ydl_opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "cookies_from_browser": ("safari",) if _is_bilibili_url(url) else None,
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -184,7 +189,12 @@ def fetch_subtitles(url: str, run_dir: Path, language: str = "zh") -> tuple[bool
 
     try:
         # 1. 探测视频信息和字幕可用性
-        check_opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+        check_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "cookies_from_browser": ("safari",) if _is_bilibili_url(url) else None,
+        }
         with yt_dlp.YoutubeDL(check_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
@@ -226,6 +236,7 @@ def fetch_subtitles(url: str, run_dir: Path, language: str = "zh") -> tuple[bool
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
+            "cookies_from_browser": ("safari",) if _is_bilibili_url(url) else None,
         }
         with yt_dlp.YoutubeDL(dl_opts) as ydl:
             ydl.download([url])
@@ -324,6 +335,7 @@ def download_audio(url: str, run_dir: Path, proxy: str | None = None) -> Path:
         "no_progress": True,
         "noplaylist": True,
         "progress_hooks": [progress_hook],
+        "cookies_from_browser": ("safari",) if _is_bilibili_url(url) else None,
     }
 
     print(f"\n📥 下载音频...")
