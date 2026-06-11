@@ -17,7 +17,7 @@ from .document import (
 from .io import read_json, write_json
 from .models import ProcessResult, Section, SlideSet, to_plain_dict
 from .quality import write_quality_report
-from .slides import detect_slides
+from .slides import deduplicate_slides, detect_slides, trim_candidates_by_transcript
 from .sync import estimate_sync_offset_ms
 from .utils import ensure_file, file_md5, slugify
 
@@ -47,6 +47,7 @@ def process_video(
     )
     slides_dir = run_dir / f"slides_{slides_slug}"
     selected_slides_dir = run_dir / f"selected_slides_{slides_slug}"
+    trimmed_dir = run_dir / f"trimmed_{slides_slug}"
     audio_path = cache_dir / f"{video_hash}_{audio_profile}.wav"
     transcript_path = cache_dir / f"{video_hash}_{backend_slug}_{model_slug}.transcript.json"
     slides_path = cache_dir / f"{video_hash}_{slides_slug}.slides.json"
@@ -60,12 +61,34 @@ def process_video(
     semantic_docx_path = run_dir / "draft_semantic.docx"
     quality_report_path = run_dir / "quality_report.md"
 
+    # 步骤 1：提取音频
     audio = extract_audio(video_path, audio_path, settings, force=_stage_forced(force_rebuild, "audio"))
+
+    # 步骤 2：ASR 转录（必须在截图裁剪之前完成）
     transcript = transcribe_audio(audio, transcript_path, settings, force=_stage_forced(force_rebuild, "asr"))
-    slides = detect_slides(video_path, slides_dir, slides_path, settings, force=_stage_forced(force_rebuild, "slides"))
+
+    # 步骤 3：生成候选截图（skip_dedupe=True，只生成候选图不做去重）
+    candidates = detect_slides(
+        video_path, slides_dir, slides_path, settings,
+        force=_stage_forced(force_rebuild, "slides"),
+        skip_dedupe=True,
+    )
+
+    # 步骤 4：按 ASR 段裁剪候选图（同段多图只留最后一张）
+    trimmed = trim_candidates_by_transcript(
+        candidates, transcript, video_path, trimmed_dir, settings,
+    )
+
+    # 步骤 5：跨段图像/OCR 去重
+    slides = deduplicate_slides(trimmed, settings)
+
+    # 步骤 6：把入选截图复制到干净目录
+    candidates_metadata = candidates.metadata  # 保留候选阶段元数据
     slides = materialize_selected_slides(slides, selected_slides_dir)
+    slides.metadata["candidates_metadata"] = candidates_metadata
     write_json(slides_path, to_plain_dict(slides))
 
+    # 步骤 7：图文对齐
     if sections_path.exists() and not _stage_forced(force_rebuild, "align"):
         sections = sections_from_dict(read_json(sections_path))
     else:
@@ -121,7 +144,7 @@ def sections_from_dict(data: dict) -> list[Section]:
 def materialize_selected_slides(slides: SlideSet, output_dir: Path) -> SlideSet:
     """把最终入选截图复制到干净目录。
 
-    检测阶段为了保留“后一张重复页”可能留下未被引用的中间图片。这里不删除
+    检测阶段为了保留"后一张重复页"可能留下未被引用的中间图片。这里不删除
     任何旧文件，只复制最终 JSON 里真正使用的图片，避免用户查看目录时误把
     中间图当成最终截图。
     """

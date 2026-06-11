@@ -4,6 +4,14 @@ from .models import Section, SlideSet, Transcript
 
 
 def align_sections(slides: SlideSet, transcript: Transcript, sync_offset_ms: int = 0) -> list[Section]:
+    """将截图与 ASR 转录按时间轴对齐。
+
+    trim_candidates_by_transcript 已保证每个 ASR 段最多对应一张图。
+    若跳过 trim 直接调用此函数（旧流程），仍可能出现同一条转录
+    重复贴在多张图上的情况。
+
+    一张图可以对应多条 ASR 段（多段之间没有画面切换，这是正确的）。
+    """
     sections: list[Section] = []
     for slide in slides.slides:
         matched_text: list[str] = []

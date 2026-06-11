@@ -10,17 +10,20 @@ from PIL import ImageChops
 from .audio import probe_duration_ms
 from .config import Settings
 from .io import read_json, write_json
-from .models import DedupeStats, Slide, SlideSet, to_plain_dict
+from .models import DedupeStats, Slide, SlideSet, Transcript, to_plain_dict
 from .ocr import extract_text, text_similarity
 from .utils import VideoToDocError, ms_to_seconds, run_command, seconds_to_ms
 
 
-def detect_slides(video_path: Path, output_dir: Path, output_json: Path, settings: Settings, force: bool = False) -> SlideSet:
+def detect_slides(video_path: Path, output_dir: Path, output_json: Path, settings: Settings, force: bool = False, skip_dedupe: bool = False) -> SlideSet:
     """检测课程讲义/PPT 截图。
 
     `fast` 只使用场景切换；`fine` 会加入固定间隔兜底点，避免渐变式
     翻页漏检；`audit` 额外保留候选截图和 HTML 审计页；`complete`
     会把候选点全部提升为最终截图，宁可多截也不漏页。
+
+    当 skip_dedupe=True 时，只生成候选图不做去重。后续可由
+    trim_candidates_by_transcript() 裁剪后再调用 deduplicate_slides()。
     """
 
     if output_json.exists() and not force:
@@ -35,7 +38,7 @@ def detect_slides(video_path: Path, output_dir: Path, output_json: Path, setting
     if settings.capture_mode in {"fine", "audit", "complete"}:
         write_candidate_audit(video_path, candidate_points, candidates_dir, run_dir / "slide_candidates.html", settings)
     boundaries = _build_boundaries(candidate_points, duration_ms, settings.min_slide_seconds)
-    keep_all = settings.capture_mode == "complete" or settings.keep_all_candidates
+    keep_all = settings.capture_mode == "complete" or settings.keep_all_candidates or skip_dedupe
 
     slides: list[Slide] = []
     previous_hashes: list[int] = []
@@ -80,7 +83,9 @@ def detect_slides(video_path: Path, output_dir: Path, output_json: Path, setting
             )
         )
 
-    slides = refine_selected_slides(video_path, slides, output_dir, settings)
+    # skip_dedupe 模式下不做精确 seek 重提取和去重
+    if not skip_dedupe:
+        slides = refine_selected_slides(video_path, slides, output_dir, settings)
 
     if not slides:
         fallback_path = output_dir / "0001.png"
@@ -100,12 +105,11 @@ def detect_slides(video_path: Path, output_dir: Path, output_json: Path, setting
             "keep_all_candidates": keep_all,
             "candidate_count": len(candidate_points),
             "dedupe_stats": to_plain_dict(dedupe_stats),
+            "skip_dedupe": skip_dedupe,
         },
     )
     write_json(output_json, to_plain_dict(slide_set))
     return slide_set
-
-
 def refine_selected_slides(video_path: Path, slides: list[Slide], output_dir: Path, settings: Settings) -> list[Slide]:
     refined: list[Slide] = []
     for index, slide in enumerate(slides, start=1):
@@ -382,3 +386,189 @@ def _build_boundaries(change_points: list[int], duration_ms: int, min_slide_seco
 
 def _is_duplicate(image_hash: int, previous_hashes: list[int], threshold: int) -> bool:
     return any(hamming_distance(image_hash, old_hash) <= threshold for old_hash in previous_hashes)
+
+
+def deduplicate_slides(
+    candidates: SlideSet,
+    settings: Settings,
+) -> SlideSet:
+    """对候选图做相邻页图像/OCR 去重。
+
+    用于 ASR 段裁剪之后的跨段重复画面处理。比如同一张 PPT 被多个
+    ASR 段引用，裁剪后仍需去重。
+
+    同一图片路径（trim 阶段可能让多个 ASR 段指向同一张图）不会被判为
+    重复合并——它们共享同一画面但对应不同的 ASR 段，合并后一张图可以
+    对应多条段（这是正确的）。只有画面内容相同但来自不同截图文件的相邻
+    slide 才会合并。
+
+    Args:
+        candidates: 已裁剪的候选图集合
+        settings: 配置对象
+
+    Returns:
+        去重后的 SlideSet
+    """
+    if not candidates.slides:
+        return candidates
+
+    dedupe_stats = DedupeStats()
+    kept: list[Slide] = []
+
+    for slide in candidates.slides:
+        # 同一图片路径 → 不走图像比较，直接合并为"一图多段"
+        if kept and kept[-1].image_path == slide.image_path:
+            # 扩展时间范围，保留同一图对应多段
+            kept[-1] = Slide(
+                slide_index=kept[-1].slide_index,
+                image_path=slide.image_path,
+                start_ms=kept[-1].start_ms,
+                end_ms=slide.end_ms,
+                capture_ms=slide.capture_ms,
+                confidence=max(kept[-1].confidence, slide.confidence),
+                hash=slide.hash,
+                edge_density=slide.edge_density,
+            )
+            continue
+
+        # 不同图片 → 正常图像/OCR 去重判断
+        if kept and is_near_duplicate(
+            Path(slide.image_path),
+            Path(kept[-1].image_path),
+            settings.hash_threshold,
+            settings,
+            dedupe_stats,
+        ):
+            # 重复：保留后一张，继承前一张的 start_ms
+            kept[-1] = Slide(
+                slide_index=kept[-1].slide_index,
+                image_path=slide.image_path,
+                start_ms=kept[-1].start_ms,
+                end_ms=slide.end_ms,
+                capture_ms=slide.capture_ms,
+                confidence=max(kept[-1].confidence, slide.confidence, 0.8),
+                hash=slide.hash,
+                edge_density=slide.edge_density,
+            )
+            continue
+
+        kept.append(
+            Slide(
+                slide_index=len(kept) + 1,
+                image_path=slide.image_path,
+                start_ms=slide.start_ms,
+                end_ms=slide.end_ms,
+                capture_ms=slide.capture_ms,
+                confidence=slide.confidence,
+                hash=slide.hash,
+                edge_density=slide.edge_density,
+            )
+        )
+
+    # 重新编号
+    for index, slide in enumerate(kept, start=1):
+        slide.slide_index = index
+
+    metadata = dict(candidates.metadata)
+    metadata["dedupe_stats"] = to_plain_dict(dedupe_stats)
+    metadata["deduplicated"] = True
+
+    return SlideSet(slides=kept, metadata=metadata)
+
+
+def trim_candidates_by_transcript(
+    candidates: SlideSet,
+    transcript: Transcript,
+    video_path: Path,
+    output_dir: Path,
+    settings: Settings,
+) -> SlideSet:
+    """按 ASR 段边界裁剪候选图。
+
+    解决"多图 → 一句话"的去重问题：同一句话期间画面可能切换了多次，
+    但讲义只需要最终呈现的那一帧。
+
+    设计文档：docs/superpowers/specs/2026-06-11-asr-driven-dedupe-design.md
+
+    时间边界说明：保留候选图的原始 start_ms/end_ms，不做强制对齐。
+    这样后续 align_sections 中的 sync_offset_ms 校正仍然有效。
+
+    Args:
+        candidates: 候选图集合（未去重）
+        transcript: ASR 转录结果
+        video_path: 视频文件路径（用于生成缺失截图）
+        output_dir: 输出目录
+        settings: 配置对象
+
+    Returns:
+        裁剪后的候选图集合（每个 ASR 段最多对应一张图）
+    """
+    if not transcript.segments:
+        # 无转录数据，返回原候选集
+        return candidates
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    trimmed_slides: list[Slide] = []
+
+    for seg_index, segment in enumerate(transcript.segments):
+        seg_start_ms = segment.start_ms
+        seg_end_ms = segment.end_ms
+        seg_mid_ms = (seg_start_ms + seg_end_ms) // 2
+
+        # 找到时间范围落在该段内的所有候选图
+        matching_slides = [
+            slide
+            for slide in candidates.slides
+            if _slide_overlaps_segment(slide, seg_start_ms, seg_end_ms)
+        ]
+
+        if matching_slides:
+            # 只保留该段内时间最晚的一张
+            latest_slide = max(matching_slides, key=lambda s: s.capture_ms)
+            # 保留候选图的原始时间边界，不做强制对齐
+            trimmed_slides.append(
+                Slide(
+                    slide_index=len(trimmed_slides) + 1,
+                    image_path=latest_slide.image_path,
+                    start_ms=latest_slide.start_ms,
+                    end_ms=latest_slide.end_ms,
+                    capture_ms=latest_slide.capture_ms,
+                    confidence=latest_slide.confidence,
+                    hash=latest_slide.hash,
+                    edge_density=latest_slide.edge_density,
+                )
+            )
+        else:
+            # 该段没有任何候选图，在段中点精确提取一帧
+            image_path = output_dir / f"{len(trimmed_slides) + 1:04d}.png"
+            extract_frame(video_path, seg_mid_ms, image_path, precise=True)
+            trimmed_slides.append(
+                Slide(
+                    slide_index=len(trimmed_slides) + 1,
+                    image_path=str(image_path),
+                    start_ms=seg_start_ms,
+                    end_ms=seg_end_ms,
+                    capture_ms=seg_mid_ms,
+                    confidence=0.6,  # 自动生成的置信度较低
+                    hash=f"{dhash(image_path):016x}",
+                    edge_density=edge_density(image_path),
+                )
+            )
+
+    # 更新元数据
+    metadata = dict(candidates.metadata)
+    metadata["trimmed_by_transcript"] = True
+    metadata["segment_count"] = len(transcript.segments)
+    metadata["trimmed_slide_count"] = len(trimmed_slides)
+
+    return SlideSet(slides=trimmed_slides, metadata=metadata)
+
+
+def _slide_overlaps_segment(slide: Slide, seg_start_ms: int, seg_end_ms: int) -> bool:
+    """判断截图时间是否与 ASR 段重叠。
+
+    使用 capture_ms（截图时间点）判断，而非 start_ms/end_ms。
+    采用半开区间 [seg_start_ms, seg_end_ms)：capture_ms 等于
+    seg_end_ms 的截图归属于下一个 ASR 段。
+    """
+    return seg_start_ms <= slide.capture_ms < seg_end_ms
