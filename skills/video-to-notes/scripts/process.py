@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""video-to-notes 主流程脚本
+"""video-to-notes: 视频链接 → 字幕/转录 → Markdown
 
-输入网页视频链接，依次完成：
-  ① yt-dlp 下载视频
-  ② ffmpeg 提取音频
-  ③ mlx-whisper 转录
+流程：URL → 字幕优先 → 无字幕时(下载音频 → ASR) → 输出 transcript.txt
 
-输出 JSON（含产物路径），供 Agent 读取 transcript.txt 后自行总结。
+借鉴：
+- tscribe 的 CLI 设计：一条命令跑完，doctor 诊断
+- AI-Video-Transcriber 的字幕优先策略：优先平台原生字幕，fallback 到 ASR
 """
 
 from __future__ import annotations
@@ -20,20 +19,25 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
-# ── 站点代理映射（参考 VideoDownloader） ──────────────────────
+# ── 站点代理映射 ──────────────────────────────────────────────
 
-SITE_PROXY_MAP: dict[str, str] = {
-    "91nt.com": "http://127.0.0.1:29290",
-}
+SITE_PROXY_MAP: dict[str, str] = {}
+
+_env_proxy = os.environ.get("VIDEO_TO_NOTES_PROXY_MAP", "")
+if _env_proxy:
+    for entry in _env_proxy.split(";"):
+        if ":" in entry:
+            _domain, _proxy = entry.split(":", 1)
+            SITE_PROXY_MAP[_domain.strip()] = f"http://{_proxy.strip()}"
 
 
 # ── 工具函数 ──────────────────────────────────────────────────
 
 
 def _get_proxy_for_url(url: str, user_proxy: str | None = None) -> str | None:
-    """根据 URL 获取代理：用户指定 > 站点配置 > None"""
     if user_proxy is not None:
         return user_proxy
     for domain, proxy in SITE_PROXY_MAP.items():
@@ -43,7 +47,6 @@ def _get_proxy_for_url(url: str, user_proxy: str | None = None) -> str | None:
 
 
 def _slugify(text: str) -> str:
-    """将标题转为文件系统友好的 slug"""
     text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', text)
     text = re.sub(r'_+', '_', text).strip('_')
     return text[:80] or "video"
@@ -51,6 +54,14 @@ def _slugify(text: str) -> str:
 
 def _short_hash(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()[:12]
+
+
+def _format_seconds(s: float) -> str:
+    if s is None or s < 0:
+        return "??:??"
+    m, sec = divmod(int(s), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
 
 
 def _format_bytes(n: float) -> str:
@@ -63,81 +74,225 @@ def _format_bytes(n: float) -> str:
     return f"{n:.1f}TiB"
 
 
-def _format_seconds(s: float) -> str:
-    if s is None or s < 0:
-        return "??:??"
-    m, sec = divmod(int(s), 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+def run_cmd(cmd: list[str], check: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout)
 
 
-def run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    """运行外部命令，捕获输出"""
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+def _is_bilibili_url(url: str) -> bool:
+    return "bilibili.com" in url or "b23.tv" in url
 
 
-# ── 依赖检查 ──────────────────────────────────────────────────
+# ── 依赖检查 & 诊断 ─────────────────────────────────────────
 
 
-def check_dependencies() -> None:
-    """启动时一次性检查所有依赖，缺什么打印安装命令并退出"""
-    missing = []
+def check_dependencies(fatal: bool = True) -> list[tuple[str, str, bool]]:
+    """检查依赖，返回 [(名称, 安装命令, 是否可用)] 列表"""
+    results = []
 
     # yt-dlp
     try:
         run_cmd(["yt-dlp", "--version"])
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        missing.append(("yt-dlp", "pip install yt-dlp pycryptodomex"))
+        results.append(("yt-dlp", "pip install yt-dlp pycryptodomex", True))
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        results.append(("yt-dlp", "pip install yt-dlp pycryptodomex", False))
 
     # ffmpeg
     try:
         run_cmd(["ffmpeg", "-version"])
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        missing.append(("ffmpeg", "brew install ffmpeg  (macOS)"))
+        results.append(("ffmpeg", "brew install ffmpeg (macOS)", True))
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        results.append(("ffmpeg", "brew install ffmpeg (macOS)", False))
 
     # mlx_whisper
     try:
         import mlx_whisper  # noqa: F401
+        results.append(("mlx-whisper", "pip install mlx-whisper", True))
     except ModuleNotFoundError:
-        missing.append(("mlx-whisper", "pip install mlx-whisper"))
+        results.append(("mlx-whisper", "pip install mlx-whisper", False))
 
-    if missing:
-        print("❌ 缺少以下依赖，请安装后重试：\n")
-        for name, install_cmd in missing:
-            print(f"  {name}: {install_cmd}")
-        print()
+    # curl_cffi (可选，用于 B站 TLS 指纹绕过)
+    try:
+        from curl_cffi import requests as _  # noqa: F401
+        results.append(("curl_cffi", "pip install curl_cffi (可选)", True))
+    except ModuleNotFoundError:
+        results.append(("curl_cffi", "pip install curl_cffi (可选，用于B站)", False))
+
+    if fatal and any(not ok for _, _, ok in results[:3]):
+        print("❌ 缺少必需依赖：\n")
+        for name, cmd, ok in results:
+            if not ok:
+                print(f"  {name}: {cmd}")
         sys.exit(1)
 
+    return results
 
-# ── 步骤 ①：下载视频 ─────────────────────────────────────────
+
+def cmd_doctor() -> None:
+    """诊断依赖和配置状态"""
+    print("🔍 video-to-notes 诊断\n")
+    results = check_dependencies(fatal=False)
+    for name, cmd, ok in results:
+        status = "✅" if ok else "❌"
+        print(f"  {status} {name}")
+        if not ok:
+            print(f"     安装：{cmd}")
+    print()
 
 
-def download_video(
-    url: str,
-    output_dir: Path,
-    resolution: str = "best",
-    proxy: str | None = None,
-) -> tuple[Path, str]:
-    """用 yt-dlp 下载视频，返回 (视频路径, 视频标题)"""
+# ── 步骤 ①：探测视频信息 ───────────────────────────────────────
+
+
+def probe_video(url: str) -> dict:
+    """用 yt-dlp 快速探测视频信息（不下载）"""
+    try:
+        import yt_dlp
+    except ModuleNotFoundError:
+        print("❌ 未安装 yt-dlp")
+        sys.exit(1)
+
+    ydl_opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    return {
+        "title": info.get("title", "video"),
+        "duration": info.get("duration", 0),
+        "uploader": info.get("uploader", ""),
+        "has_subtitles": bool(info.get("subtitles")),
+        "has_auto_captions": bool(info.get("automatic_captions")),
+    }
+
+
+# ── 步骤 ②：字幕优先下载 ───────────────────────────────────────
+
+
+def fetch_subtitles(url: str, run_dir: Path, language: str = "zh") -> tuple[bool, str | None, str]:
+    """优先下载平台原生字幕（比 ASR 快很多）
+
+    借鉴 AI-Video-Transcriber 的字幕优先策略：
+    1. 检查 info 中的 subtitles / automatic_captions
+    2. 优先人工字幕，其次自动字幕
+    3. 按语言优先级选择：zh-Hans > zh > en > 其他
+    4. 下载字幕文件并解析为纯文本
+
+    Returns: (是否成功, 字幕纯文本, 视频标题)
+    """
+    try:
+        import yt_dlp
+    except ModuleNotFoundError:
+        return False, None, ""
+
+    try:
+        # 1. 探测视频信息和字幕可用性
+        check_opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+        with yt_dlp.YoutubeDL(check_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        title = info.get("title", "video")
+        manual_subs: dict = info.get("subtitles") or {}
+        auto_caps: dict = info.get("automatic_captions") or {}
+
+        # 过滤非语音轨道
+        manual_langs = [k for k in manual_subs if not k.startswith("live_chat")]
+        auto_langs = [k for k in auto_caps if not k.startswith("live_chat")]
+
+        if not manual_langs and not auto_langs:
+            print("  ℹ️  视频无可用字幕，将使用 ASR")
+            return False, None, title
+
+        # 2. 优先人工字幕
+        prefer_manual = bool(manual_langs)
+        candidate_langs = manual_langs if prefer_manual else auto_langs
+
+        # 3. 按优先级选语言
+        _priority = ["zh-Hans", "zh-Hant", "zh", "en", "ja", "ko"]
+        prefer_lang = next(
+            (lang for lang in _priority if lang in candidate_langs),
+            candidate_langs[0],
+        )
+        sub_type = "手动" if prefer_manual else "自动"
+        print(f"  🔤 发现{sub_type}字幕，语言：{prefer_lang}（候选 {len(candidate_langs)} 种）")
+
+        # 4. 仅下载字幕文件
+        sub_dir = run_dir / ".subs"
+        sub_dir.mkdir(exist_ok=True)
+        dl_opts = {
+            "writesubtitles": prefer_manual,
+            "writeautomaticsub": not prefer_manual,
+            "subtitlesformat": "srt/best",
+            "subtitleslangs": [prefer_lang],
+            "skip_download": True,
+            "outtmpl": str(sub_dir / "sub.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(dl_opts) as ydl:
+            ydl.download([url])
+
+        # 5. 查找并解析字幕文件
+        for ext in ["srt", "vtt", "ass", "lrc"]:
+            sub_file = sub_dir / f"sub.{ext}"
+            if sub_file.exists():
+                text = _parse_subtitle_file(sub_file)
+                if text:
+                    print(f"  ✅ 字幕提取完成：{len(text)} 字")
+                    # 清理临时字幕目录
+                    shutil.rmtree(sub_dir, ignore_errors=True)
+                    return True, text, title
+
+        print("  ⚠️  字幕文件解析失败，将使用 ASR")
+        shutil.rmtree(sub_dir, ignore_errors=True)
+        return False, None, title
+
+    except Exception as e:
+        print(f"  ⚠️  字幕下载失败（{e}），将使用 ASR")
+        return False, None, ""
+
+
+def _parse_subtitle_file(path: Path) -> str | None:
+    """解析 SRT/VTT 字幕文件，提取纯文本"""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    lines = []
+    for line in content.splitlines():
+        line = line.strip()
+        # 跳过序号、时间轴、空行、标签
+        if not line:
+            continue
+        if re.match(r'^\d+$', line):
+            continue
+        if re.match(r'^\d{2}:\d{2}', line) or '-->' in line:
+            continue
+        if line.startswith('WEBVTT') or line.startswith('NOTE'):
+            continue
+        # 清理 HTML 标签
+        line = re.sub(r'<[^>]+>', '', line)
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines) if lines else None
+
+
+# ── 步骤 ③：下载视频（仅音频） ────────────────────────────────
+
+
+def download_audio(url: str, run_dir: Path, proxy: str | None = None) -> Path:
+    """用 yt-dlp 下载最佳音频流（参考 tscribe：只下音频，不下视频）"""
     effective_proxy = _get_proxy_for_url(url, proxy)
 
-    # 分辨率到 yt-dlp format 的映射
-    fmt_map = {
-        "best": "bestvideo*+bestaudio/best",
-        "2160p": "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
-        "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]",
-        "360p": "bestvideo[height<=360]+bestaudio/best[height<=360]",
-        "audio": "bestaudio/best",
-    }
-    fmt = fmt_map.get(resolution, fmt_map["best"])
+    try:
+        import yt_dlp
+    except ModuleNotFoundError:
+        print("❌ 未安装 yt-dlp")
+        sys.exit(1)
 
-    outtmpl = str(output_dir / "video.%(ext)s")
+    outtmpl = str(run_dir / "audio.%(ext)s")
 
-    # 进度回调，每 10 秒打印一行
     last_log = [0.0]
-
     def progress_hook(d):
         if d["status"] == "downloading":
             now = time.time()
@@ -149,81 +304,50 @@ def download_video(
             speed = d.get("speed", 0)
             eta = d.get("eta")
             pct = f"{downloaded / total * 100:.1f}%" if total else "??%"
-            down_str = _format_bytes(downloaded)
-            total_str = _format_bytes(total) if total else "??"
             speed_str = f"{_format_bytes(speed)}/s" if speed else "??"
             eta_str = _format_seconds(eta) if eta is not None else "??:??"
-            print(f"  {pct}  {down_str}/{total_str}  {speed_str}  剩余 {eta_str}")
+            print(f"  {pct}  速度: {speed_str}  剩余: {eta_str}")
         elif d["status"] == "finished":
-            total = d.get("total_bytes")
-            print(f"  ✅ 下载完成，大小 {_format_bytes(total)}")
+            print(f"  ✅ 音频下载完成")
 
     ydl_opts = {
-        "format": fmt,
+        "format": "bestaudio/best",
         "outtmpl": outtmpl,
-        "merge_output_format": "mp4",
+        "extract_audio": True,
+        "audio_format": "wav",
+        "audioquality": "0",
+        "postprocessor_args": ["-ac", "1", "-ar", "16000"],
+        "prefer_ffmpeg": True,
         "proxy": effective_proxy or "",
         "quiet": True,
         "no_warnings": True,
         "no_progress": True,
+        "noplaylist": True,
         "progress_hooks": [progress_hook],
     }
 
-    try:
-        import yt_dlp
-    except ModuleNotFoundError:
-        print("❌ 未安装 yt-dlp，请执行：pip install yt-dlp pycryptodomex")
-        sys.exit(1)
-
-    print(f"\n📥 正在下载视频：{url}")
+    print(f"\n📥 下载音频...")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         title = info.get("title", "video")
 
-    # 找到下载后的实际文件
-    video_path = output_dir / "video.mp4"
-    if not video_path.exists():
-        # 可能是其他格式
-        for ext in ["mkv", "webm", "mp4"]:
-            candidate = output_dir / f"video.{ext}"
+    # 找到音频文件
+    audio_path = run_dir / "audio.wav"
+    if not audio_path.exists():
+        for ext in ["m4a", "mp3", "ogg", "wav"]:
+            candidate = run_dir / f"audio.{ext}"
             if candidate.exists():
-                video_path = candidate
+                audio_path = candidate
                 break
 
-    if not video_path.exists():
-        print("❌ 下载完成但找不到视频文件")
+    if not audio_path.exists():
+        print("❌ 下载完成但找不到音频文件")
         sys.exit(1)
 
-    return video_path, title
+    return audio_path
 
 
-# ── 步骤 ②：提取音频 ─────────────────────────────────────────
-
-
-def extract_audio(video_path: Path, output_path: Path) -> Path:
-    """用 ffmpeg 提取 16kHz 单声道 WAV"""
-    if output_path.exists():
-        print("  ⏭️  音频已存在，跳过提取")
-        return output_path
-
-    print("\n🎵 提取音频...")
-    cmd = [
-        "ffmpeg", "-y", "-i", str(video_path),
-        "-vn", "-ac", "1", "-ar", "16000",
-        "-acodec", "pcm_s16le",
-        str(output_path),
-    ]
-    try:
-        run_cmd(cmd)
-    except subprocess.CalledProcessError as e:
-        print(f"❌ ffmpeg 提取音频失败：{e.stderr}")
-        sys.exit(1)
-
-    print(f"  ✅ 音频已保存：{output_path.name}")
-    return output_path
-
-
-# ── 步骤 ③：ASR 转录 ─────────────────────────────────────────
+# ── 步骤 ④：ASR 转录 ─────────────────────────────────────────
 
 
 def transcribe_audio(
@@ -233,10 +357,15 @@ def transcribe_audio(
     asr_model: str,
     language: str,
 ) -> None:
-    """用 mlx-whisper 转录，输出 JSON + 纯文本"""
+    """用 mlx-whisper 转录"""
     if transcript_json_path.exists() and transcript_txt_path.exists():
-        print("  ⏭️  转录结果已存在，跳过 ASR")
-        return
+        json_size = transcript_json_path.stat().st_size
+        txt_size = transcript_txt_path.stat().st_size
+        if json_size > 0 and txt_size > 0:
+            print("  ⏭️  转录结果已存在，跳过 ASR")
+            return
+        transcript_json_path.unlink(missing_ok=True)
+        transcript_txt_path.unlink(missing_ok=True)
 
     print(f"\n🎙️ 正在转录（模型：{asr_model}）...")
 
@@ -244,6 +373,8 @@ def transcribe_audio(
         import mlx_whisper
     except ModuleNotFoundError:
         print("❌ 未安装 mlx-whisper，请执行：pip install mlx-whisper")
+        transcript_json_path.unlink(missing_ok=True)
+        transcript_txt_path.unlink(missing_ok=True)
         sys.exit(1)
 
     kwargs = {
@@ -254,11 +385,14 @@ def transcribe_audio(
     try:
         result = mlx_whisper.transcribe(str(audio_path), **kwargs)
     except TypeError:
-        # 兼容不同 mlx-whisper 版本
         kwargs.pop("initial_prompt", None)
         result = mlx_whisper.transcribe(str(audio_path), **kwargs)
+    except Exception as e:
+        transcript_json_path.unlink(missing_ok=True)
+        transcript_txt_path.unlink(missing_ok=True)
+        print(f"❌ ASR 转录失败：{e}")
+        sys.exit(1)
 
-    # 构建转录数据
     segments = []
     text_lines = []
     for seg in result.get("segments", []):
@@ -267,137 +401,160 @@ def transcribe_audio(
         text = str(seg.get("text", "")).strip()
         if not text:
             continue
-        segments.append({
-            "start_ms": start_ms,
-            "end_ms": end_ms,
-            "text": text,
-        })
+        segments.append({"start_ms": start_ms, "end_ms": end_ms, "text": text})
         text_lines.append(text)
 
-    # 写入 JSON
     transcript_data = {
         "backend": "mlx-whisper",
         "model": asr_model,
         "language": result.get("language", language),
         "segments": segments,
     }
-    transcript_json_path.write_text(
-        json.dumps(transcript_data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    # 写入纯文本
-    transcript_txt_path.write_text(
-        "\n".join(text_lines),
-        encoding="utf-8",
-    )
+    transcript_json_path.write_text(json.dumps(transcript_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    transcript_txt_path.write_text("\n".join(text_lines), encoding="utf-8")
 
     duration_sec = segments[-1]["end_ms"] / 1000 if segments else 0
     print(f"  ✅ 转录完成：{len(segments)} 段，时长 {_format_seconds(duration_sec)}")
 
 
+# ── 步骤 ⑤：保存字幕来源的转录 ────────────────────────────────
+
+
+def save_subtitle_as_transcript(
+    subtitle_text: str,
+    transcript_json_path: Path,
+    transcript_txt_path: Path,
+    language: str,
+) -> None:
+    """将字幕文本保存为标准转录格式"""
+    lines = [line.strip() for line in subtitle_text.splitlines() if line.strip()]
+
+    segments = []
+    for i, line in enumerate(lines):
+        segments.append({"start_ms": i * 5000, "end_ms": (i + 1) * 5000, "text": line})
+
+    transcript_data = {
+        "backend": "subtitle",
+        "model": "platform-subtitle",
+        "language": language,
+        "segments": segments,
+    }
+    transcript_json_path.write_text(json.dumps(transcript_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    transcript_txt_path.write_text(subtitle_text, encoding="utf-8")
+    print(f"  ✅ 字幕转录保存完成：{len(lines)} 行")
+
+
 # ── 清理 ──────────────────────────────────────────────────────
 
 
-def cleanup(run_dir: Path, mode: str) -> None:
-    """按模式清理产物"""
+def cleanup(run_dir: Path, mode: str) -> set[str]:
+    cleaned = set()
     if mode == "all":
-        # 删除视频和音频，保留转录和总结
-        for name in ["video.mp4", "audio.wav"]:
+        for name in ["audio.wav", "audio.m4a"]:
             f = run_dir / name
             if f.exists():
                 f.unlink()
+                cleaned.add(name)
                 print(f"  🗑️  已清理：{name}")
     elif mode == "transcript-only":
-        # 只保留 summary.md
-        for name in ["video.mp4", "audio.wav", "transcript.json", "transcript.txt"]:
+        for name in ["audio.wav", "audio.m4a", "transcript.json", "transcript.txt"]:
             f = run_dir / name
             if f.exists():
                 f.unlink()
+                cleaned.add(name)
                 print(f"  🗑️  已清理：{name}")
+    return cleaned
 
 
 # ── 主流程 ────────────────────────────────────────────────────
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="video-to-notes：网页视频 → 下载 → 音频 → 转录"
-    )
-    parser.add_argument("url", help="视频网页链接")
-    parser.add_argument(
-        "--output-dir", default="./runs",
-        help="运行产物输出目录（默认 ./runs）",
-    )
-    parser.add_argument(
-        "--resolution", default="best",
-        choices=["best", "2160p", "1080p", "720p", "480p", "360p", "audio"],
-        help="视频分辨率（默认 best）",
-    )
-    parser.add_argument(
-        "--asr-model",
-        default="mlx-community/whisper-large-v3-turbo",
-        help="mlx-whisper 模型（默认 mlx-community/whisper-large-v3-turbo）",
-    )
-    parser.add_argument("--proxy", default=None, help="代理地址（如 http://127.0.0.1:29290）")
-    parser.add_argument(
-        "--cleanup", default=None,
-        choices=["all", "transcript-only"],
-        help="清理模式：all=删除视频+音频，transcript-only=只保留 summary.md",
-    )
-    parser.add_argument("--language", default="zh", help="ASR 语言（默认 zh）")
-    args = parser.parse_args()
-
-    # ① 依赖检查
+def cmd_process(args: argparse.Namespace) -> None:
+    """主流程：URL → 字幕优先 → ASR fallback → 输出"""
     check_dependencies()
 
-    # ② 创建运行目录
+    url = args.url
     base_dir = Path(args.output_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    # 先获取视频标题用于命名目录
-    print(f"🔗 目标 URL：{args.url}")
-    run_dir_name = f"notes_{_short_hash(args.url)}"
+    print(f"🔗 {url}")
+    run_dir_name = f"notes_{_short_hash(url)}"
     run_dir = base_dir / run_dir_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # ③ 下载视频
-    video_path, title = download_video(
-        args.url, run_dir, args.resolution, args.proxy,
-    )
-
-    # 下载后用标题重新命名目录
-    new_dir_name = f"{_slugify(title)}_{_short_hash(args.url)}"
-    new_dir = base_dir / new_dir_name
-    if run_dir != new_dir and not new_dir.exists():
-        run_dir.rename(new_dir)
-        run_dir = new_dir
-        video_path = run_dir / video_path.name
-
-    # ④ 提取音频
-    audio_path = run_dir / "audio.wav"
-    extract_audio(video_path, audio_path)
-
-    # ⑤ ASR 转录
     transcript_json_path = run_dir / "transcript.json"
     transcript_txt_path = run_dir / "transcript.txt"
-    transcribe_audio(audio_path, transcript_json_path, transcript_txt_path, args.asr_model, args.language)
 
-    # ⑥ 清理（如果指定）
+    # ① 字幕优先策略
+    print("\n🔤 尝试获取平台字幕...")
+    has_subtitle, subtitle_text, title = fetch_subtitles(url, run_dir, args.language)
+
+    if has_subtitle and subtitle_text:
+        # 字幕成功，直接保存为转录
+        save_subtitle_as_transcript(subtitle_text, transcript_json_path, transcript_txt_path, args.language)
+    else:
+        # ② 无字幕，下载音频 + ASR
+        title = title or "video"
+        audio_path = download_audio(url, run_dir, args.proxy)
+        transcribe_audio(audio_path, transcript_json_path, transcript_txt_path, args.asr_model, args.language)
+
+    # ③ 用标题重命名目录
+    new_dir_name = f"{_slugify(title)}_{_short_hash(url)}"
+    new_dir = base_dir / new_dir_name
+    if run_dir != new_dir:
+        try:
+            if not new_dir.exists():
+                run_dir.rename(new_dir)
+                run_dir = new_dir
+        except OSError:
+            print(f"  ⚠️  目录重命名失败，继续使用：{run_dir.name}")
+
+    # ④ 清理
+    cleaned_files: set[str] = set()
     if args.cleanup:
-        cleanup(run_dir, args.cleanup)
+        cleaned_files = cleanup(run_dir, args.cleanup)
 
-    # ⑦ 输出结果
+    # ⑤ 输出结果
     result = {
         "run_dir": str(run_dir.resolve()),
-        "video": str((run_dir / "video.mp4").resolve()) if (run_dir / "video.mp4").exists() else None,
-        "audio": str(audio_path.resolve()) if audio_path.exists() else None,
-        "transcript_json": str(transcript_json_path.resolve()),
-        "transcript_txt": str(transcript_txt_path.resolve()),
         "title": title,
+        "source": "subtitle" if has_subtitle else "asr",
+        "transcript_json": None if "transcript.json" in cleaned_files else (str(transcript_json_path.resolve()) if transcript_json_path.exists() else None),
+        "transcript_txt": None if "transcript.txt" in cleaned_files else (str(transcript_txt_path.resolve()) if transcript_txt_path.exists() else None),
     }
-    print(f"\n✅ 全部完成！")
+    print(f"\n✅ 完成！（来源：{'字幕' if has_subtitle else 'ASR'}）")
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="video-to-notes：视频链接 → 字幕/转录 → Markdown"
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # 默认模式：直接传 URL
+    parser.add_argument("url", nargs="?", help="视频网页链接")
+    parser.add_argument("--output-dir", default="./runs", help="产物目录（默认 ./runs）")
+    parser.add_argument("--asr-model", default="mlx-community/whisper-large-v3-turbo", help="mlx-whisper 模型")
+    parser.add_argument("--language", default="zh", help="语言（默认 zh）")
+    parser.add_argument("--proxy", default=None, help="代理地址")
+    parser.add_argument("--cleanup", default=None, choices=["all", "transcript-only"], help="清理模式")
+    parser.add_argument("--no-subtitle", action="store_true", help="跳过字幕，强制使用 ASR")
+
+    # doctor 子命令
+    subparsers.add_parser("doctor", help="诊断依赖和配置")
+
+    args = parser.parse_args()
+
+    if args.command == "doctor":
+        cmd_doctor()
+        return
+
+    if not args.url:
+        parser.print_help()
+        sys.exit(1)
+
+    cmd_process(args)
 
 
 if __name__ == "__main__":
