@@ -52,6 +52,19 @@ capture → review-segments(agent 介入) → finalize
 - 确认视频文件、`transcript.json` 是否存在
 - 缺少时提示用户先运行 `video-summary`
 
+### ①.5 前置合并（复用 video-summary 转录时）
+
+当通过 `--transcript` 复用 video-summary 产出的 `transcript.json` 时，若碎段很多（半句话一段，
+通常 ASR 产出数百段），直接用于图文对齐会导致每页只有半句话、页数碎片化。此时应**先执行
+video-summary 的 ⑤.5 语义合并步骤**：
+
+1. `prepare_merge`：读取 `transcript.json` 生成 `merge_input.json`（含目标段数建议）
+2. Agent 按 ⑤.5 合并规则写 `merged_groups.json`（同话题聚合，原文保留只加标点）
+3. `apply_merge` 校验并落盘，产出 `transcript_merged.json`（约数十段）
+
+pipeline 会**自动优先使用同目录的 `transcript_merged.json`**（若存在），无需额外参数；
+若未做合并，则回退使用原始 `transcript.json`。
+
 ### ② 截图 + 三段式去重
 
 - 运行 `scripts/process.py`，默认 `--capture-mode audit --fallback-interval-sec 15 --ocr-dedupe`

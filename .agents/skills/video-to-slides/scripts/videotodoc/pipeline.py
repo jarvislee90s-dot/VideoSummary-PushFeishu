@@ -32,6 +32,18 @@ from datetime import datetime
 from .utils import ensure_file, file_md5, slugify
 
 
+def _transcript_from_external(data: object, language: str) -> "Transcript":
+    """从外部 transcript 构造，兼容 秒·float / 毫秒·int（卡点⑥根因）。"""
+    from .models import Transcript, TranscriptSegment
+    items = data if isinstance(data, list) else data.get("segments", [])  # type: ignore[union-attr]
+    segs = [TranscriptSegment(
+        start_ms=int(s["start_ms"]) if "start_ms" in s else int(round(float(s.get("start", 0)) * 1000)),
+        end_ms=int(s["end_ms"]) if "end_ms" in s else int(round(float(s.get("end", 0)) * 1000)),
+        text=s.get("text", ""),
+    ) for s in items]
+    return Transcript(backend="reused", language=language, segments=segs)
+
+
 def capture_video(
     video_path: Path,
     runs_dir: Path,
@@ -71,16 +83,15 @@ def capture_video(
     # 步骤 1-2：音频 + ASR
     audio = extract_audio(video_path, audio_path, settings, force=_stage_forced(force_rebuild, "audio"))
     if settings.transcript_path:
-        from .models import Transcript, TranscriptSegment
-        data = read_json(Path(settings.transcript_path))
-        segs = [TranscriptSegment(start_ms=int(s["start_ms"]) if "start_ms" in s else int(round(float(s.get("start", 0)) * 1000)),
-                                  end_ms=int(s["end_ms"]) if "end_ms" in s else int(round(float(s.get("end", 0)) * 1000)),
-                                  text=s.get("text", ""))
-                for s in (data if isinstance(data, list) else data.get("segments", []))]
-        transcript = Transcript(backend="reused", language=settings.language, segments=segs)
+        tpath = Path(settings.transcript_path)
+        merged_path = tpath.parent / "transcript_merged.json"
+        source_path = merged_path if merged_path.exists() else tpath
+        if merged_path.exists():
+            print(f"  ♻️  使用已合并转录：{merged_path.name}")
+        transcript = _transcript_from_external(read_json(source_path), settings.language)
         # 写入 cache 供 finalize 阶段读取
         write_json(transcript_path, to_plain_dict(transcript))
-        print(f"  ♻️  复用已有转录（{len(segs)} 段）")
+        print(f"  ♻️  复用已有转录（{len(transcript.segments)} 段）")
     else:
         transcript = transcribe_audio(audio, transcript_path, settings, force=_stage_forced(force_rebuild, "asr"))
 
@@ -153,13 +164,7 @@ def finalize_video(
     # 找 transcript 缓存
     transcript_files = list(cache_dir.glob("*.transcript.json"))
     if transcript_files:
-        from .models import Transcript, TranscriptSegment
-        tdata = read_json(transcript_files[0])
-        tsegs = [TranscriptSegment(start_ms=int(s["start_ms"]) if "start_ms" in s else int(round(float(s.get("start", 0)) * 1000)),
-                                   end_ms=int(s["end_ms"]) if "end_ms" in s else int(round(float(s.get("end", 0)) * 1000)),
-                                   text=s.get("text", ""))
-                 for s in (tdata if isinstance(tdata, list) else tdata.get("segments", []))]
-        transcript = Transcript(backend="reused", language=settings.language, segments=tsegs)
+        transcript = _transcript_from_external(read_json(transcript_files[0]), settings.language)
     else:
         raise SystemExit("❌ 找不到转录缓存，请重新运行 capture")
 
@@ -280,15 +285,13 @@ def process_video(
 
     # 步骤 2：ASR 转录（必须在截图裁剪之前完成）
     if settings.transcript_path:
-        from .io import read_json
-        from .models import Transcript, TranscriptSegment
-        data = read_json(Path(settings.transcript_path))
-        segs = [TranscriptSegment(start_ms=int(s["start_ms"]) if "start_ms" in s else int(round(float(s.get("start", 0)) * 1000)),
-                                  end_ms=int(s["end_ms"]) if "end_ms" in s else int(round(float(s.get("end", 0)) * 1000)),
-                                  text=s.get("text", ""))
-                for s in (data if isinstance(data, list) else data.get("segments", []))]
-        transcript = Transcript(backend="reused", language=settings.language, segments=segs)
-        print(f"  ♻️  复用已有转录：{settings.transcript_path}（{len(segs)} 段）")
+        tpath = Path(settings.transcript_path)
+        merged_path = tpath.parent / "transcript_merged.json"
+        source_path = merged_path if merged_path.exists() else tpath
+        if merged_path.exists():
+            print(f"  ♻️  使用已合并转录：{merged_path.name}")
+        transcript = _transcript_from_external(read_json(source_path), settings.language)
+        print(f"  ♻️  转录段数：{len(transcript.segments)}")
     else:
         transcript = transcribe_audio(audio, transcript_path, settings, force=_stage_forced(force_rebuild, "asr"))
 

@@ -52,6 +52,47 @@ description: "输入视频链接或本地视频文件路径，自动获取平台
    - 默认使用 `mlx-whisper`（Apple Silicon 优化）
    - 生成 `transcript.json`（带时间戳）+ `transcript.txt`（纯文本）
 
+### ⑤.5 Agent 合并转录碎段
+
+**背景**：ASR 按语音停顿把句子切得太碎（平均 1-2 秒一句、半句话一段），
+直接用于图文对齐会导致每页只有半句话。需要你把碎段按语义合并成完整段落。
+
+**步骤**：
+1. 运行 prepare_merge 生成合并输入清单（含目标段数建议）：
+   python3 .agents/skills/video-summary/scripts/prepare_merge.py \
+     runs/<run_dir>/transcript.json
+2. 读取 runs/<run_dir>/merge_input.json（含 total_segments、suggestion、segments 清单）
+3. 把相邻短句按语义合并为段落，写 runs/<run_dir>/merged_groups.json：
+   [{"indices": [0,1,2,3,4,5,6,7,8], "text": "合并后的一段话"}, ...]
+4. 运行 apply_merge 校验并落盘：
+   python3 .agents/skills/video-summary/scripts/apply_merge.py \
+     runs/<run_dir>/transcript.json runs/<run_dir>/merged_groups.json
+   失败则按报错修正 merged_groups.json 出错的分组后重跑本步（断点重做，不全量重做）
+
+**合并规则**（严格遵守）：
+1. **原文保留**：完整保留每个短句的原文字，不删字、不改字、不加字、不调换顺序。
+   你只在短句连接处插入标点。
+2. **标点连接**：短句间加合适标点——逗号（停顿/并列/分句）、句号（句末）、
+   分号（并列长句）、问号/感叹号（原句语气）、冒号（引出）。保留原问号感叹号。
+3. **同话题聚合（最高优先级）**：描述同一件事/同一话题的相邻短句必须整到一段。
+   话题转换处断段。宁可段数偏离目标，也要保证同话题完整。
+4. **段数软目标**：参考 suggestion.target_segments 和 per_group_range。
+   段数是软目标——同话题完整优先于凑段数。硬上限 max_segments 不可超。
+5. **索引完整**：indices 从 0 连续到末尾，覆盖全部短句，不重不漏；每段内连续递增。
+
+**示例**：
+输入：0.Harness这个词最近大火 1.但好像很少有人能说出它的准确定义
+      2.但这又不妨碍很多人成天把它挂在嘴边 3.那这件事就比较奇怪了
+      4.为什么一个连定义都还没有搞明白的抽象概念 5.会这么火热
+      6.甚至代表了一个新的技术方向呢 7.别急
+      8.今天这期视频就带你一口气了解Harness的来龙去脉
+输出：{"indices": [0,1,2,3,4,5,6,7,8],
+       "text": "Harness这个词最近大火，但好像很少有人能说出它的准确定义，但这又不妨碍很多人成天把它挂在嘴边。那这件事就比较奇怪了，为什么一个连定义都还没有搞明白的抽象概念，会这么火热，甚至代表了一个新的技术方向呢？别急，今天这期视频就带你一口气了解Harness的来龙去脉。"}
+
+**注意**：apply_merge 只校验 index 结构（连续覆盖），不校验 text 内容，
+所以你整理长句时个别字误差不会报错；只有 index 漏号/跳号/重复才报错，
+且报错精确到具体分组，只需修正出错分组重写文件重跑。
+
 6. **Agent 摘要**：
    - Agent 读取 `transcript.txt`
    - 生成 `<视频标题>_总结_<时间戳>.md`：
