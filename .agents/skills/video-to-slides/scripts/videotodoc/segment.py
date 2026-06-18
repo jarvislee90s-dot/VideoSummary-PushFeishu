@@ -42,14 +42,16 @@ def generate_pending_segments(
     max_segment_chars: int = 400,
     min_segment_chars: int = 30,
 ) -> dict[str, Any]:
-    """生成分段草案 pending_segments.json 的数据结构。
+    """基于 transcript 内容密度生成分段草案。
 
+    分段边界由 transcript 内容决定，不由候选图 capture_ms 决定。
     启发式规则：
-    1. 按候选图 capture_ms 把时间轴切成原始片段
-    2. 相邻片段文本相似度 ≥0.85，或时长和 <60s 且无步骤词 → merge
-    3. 含步骤词且片段 <20s → 强制 keep，不合并
-    4. 单段文字 > max_segment_chars → split
-    5. 单段文字 < min_segment_chars 且无独立场景（无候选图）→ merge 到前一段
+    1. 以 transcript segment 边界为初始切分点
+    2. 相邻片段文本相似度 >= 0.85 → merge
+    3. 相邻片段合并后字数 <= max_segment_chars 且无步骤词 → merge
+    4. 单段字数 > max_segment_chars → 标记 split
+    5. 单段字数 < min_segment_chars → 标记 merge 到前一段
+    6. 候选图 slide_ids 记录在段内，但不决定边界
     """
     interval = capture_interval_for_duration(duration_sec)
 
@@ -57,59 +59,44 @@ def generate_pending_segments(
         return {"video_title": "", "duration_sec": int(duration_sec),
                 "capture_interval_sec": interval, "segments": []}
 
-    # 按候选图 capture_ms 切分时间段
-    capture_times = sorted({s.capture_ms for s in candidates.slides})
-    if not capture_times:
-        capture_times = [0]
-
-    boundaries = [0, *capture_times, transcript.segments[-1].end_ms]
+    # 以 transcript segment 为初始片段
     raw_segments = []
-    for i in range(len(boundaries) - 1):
-        start_ms = boundaries[i]
-        end_ms = boundaries[i + 1]
-        # 收集该时间段内的 transcript 文本
-        texts = [seg.text for seg in transcript.segments
-                 if start_ms <= seg.start_ms < end_ms]
-        text = "".join(texts)
-        if not text:
-            continue
-        # 该时间段对应的候选图
-        slide_ids = [s.slide_index for s in candidates.slides
-                     if start_ms <= s.capture_ms < end_ms]
+    for seg in transcript.segments:
         raw_segments.append({
-            "start_ms": start_ms, "end_ms": end_ms,
-            "text": text, "slide_ids": slide_ids,
+            "start_ms": seg.start_ms,
+            "end_ms": seg.end_ms,
+            "text": seg.text,
         })
 
-    # 合并相邻片段
-    merged = []
+    # 合并相邻片段：仅合并真正的碎片（< 10 字），不因相似度合并完整句
+    FRAGMENT_CHARS = 10
+    merged: list[dict] = []
     for seg in raw_segments:
         if merged:
             prev = merged[-1]
             combined_text = prev["text"] + seg["text"]
-            time_sum = (seg["end_ms"] - prev["start_ms"]) / 1000
-            should_merge = (
-                _text_similarity(prev["text"], seg["text"]) >= 0.85
-                or (time_sum < 60 and not _has_step_words(seg["text"])
-                    and not _has_step_words(prev["text"]))
-                or (len(seg["text"]) < min_segment_chars and not seg["slide_ids"])
+            is_fragment = (
+                len(seg["text"]) < FRAGMENT_CHARS
+                and not _has_step_words(seg["text"])
             )
-            if should_merge and len(combined_text) <= max_segment_chars:
+            if is_fragment and len(combined_text) <= max_segment_chars:
                 prev["end_ms"] = seg["end_ms"]
                 prev["text"] = combined_text
-                prev["slide_ids"].extend(seg["slide_ids"])
                 continue
         merged.append(dict(seg))
 
-    # 生成最终 segment 列表
+    # 为每个段关联候选图
     segments = []
     for i, seg in enumerate(merged, start=1):
         char_count = len(seg["text"])
+        # 找该时间范围内的候选图
+        slide_ids = [s.slide_index for s in candidates.slides
+                     if seg["start_ms"] <= s.capture_ms < seg["end_ms"]]
         action = "keep"
         extra = {}
         if char_count > max_segment_chars:
             action = "split"
-        elif i > 1 and char_count < min_segment_chars and not _has_step_words(seg["text"]) and not seg["slide_ids"]:
+        elif i > 1 and char_count < min_segment_chars and not _has_step_words(seg["text"]):
             action = "merge"
             extra["merge_into"] = f"s{i - 1:02d}"
         segments.append({
@@ -118,7 +105,7 @@ def generate_pending_segments(
             "end_ms": seg["end_ms"],
             "label": seg["text"][:20].strip(),
             "suggested_action": action,
-            "candidate_slide_ids": seg["slide_ids"],
+            "candidate_slide_ids": slide_ids,
             "reason": f"字数{char_count}，时长{(seg['end_ms'] - seg['start_ms']) / 1000:.0f}s",
             "transcript_preview": seg["text"][:80],
             "char_count": char_count,

@@ -102,3 +102,74 @@ class TestValidateConfirmedSegments:
 
     def test_empty_segments(self):
         assert validate_confirmed_segments({"segments": []}) is False
+
+
+class TestTranscriptDrivenSegmentation:
+    """分段边界由 transcript 内容决定，不由候选图 capture_ms 决定。"""
+
+    def _make_candidates(self, times_ms: list[int]) -> SlideSet:
+        return SlideSet(slides=[
+            Slide(slide_index=i + 1, image_path=f"img{i}.png", start_ms=t, end_ms=t + 1000,
+                  capture_ms=t, confidence=0.8, hash="0" * 16, edge_density=0.5)
+            for i, t in enumerate(times_ms)
+        ])
+
+    def _make_transcript(self, segments: list[tuple[int, int, str]]) -> Transcript:
+        return Transcript(
+            backend="test", language="zh",
+            segments=[TranscriptSegment(start_ms=s, end_ms=e, text=t) for s, e, t in segments],
+        )
+
+    def test_transcript_driven_boundaries_not_candidate_capture_ms(self):
+        """分段边界由 transcript 内容决定，不由候选图 capture_ms 决定。"""
+        candidates = self._make_candidates([5000, 10000, 15000])
+        transcript = self._make_transcript([
+            (0, 40000, "今天我们来聊聊智能办公本的选购要点。首先看价位段。"),
+        ])
+        result = generate_pending_segments(candidates, transcript, duration_sec=40)
+        # 应该只有 1 个段，边界是 0-40000，不是 5000/10000/15000
+        assert len(result["segments"]) == 1
+        seg = result["segments"][0]
+        assert seg["start_ms"] == 0
+        assert seg["end_ms"] == 40000
+
+    def test_dense_candidates_dont_fragment_segments(self):
+        """密集候选图不会把一个语义段拆成多个。"""
+        candidates = self._make_candidates([5000, 10000, 15000, 20000, 25000])
+        transcript = self._make_transcript([
+            (0, 30000, "第一部分介绍产品A的特点和优势。"),
+            (30000, 60000, "第二部分介绍产品B的特点和优势。"),
+        ])
+        result = generate_pending_segments(candidates, transcript, duration_sec=60)
+        # 2 个语义段，不是 5 个（候选图数量）
+        assert len(result["segments"]) == 2
+        assert result["segments"][0]["start_ms"] == 0
+        assert result["segments"][0]["end_ms"] == 30000
+        assert result["segments"][1]["start_ms"] == 30000
+        assert result["segments"][1]["end_ms"] == 60000
+
+    def test_short_transcript_segments_merged_by_density(self):
+        """短 transcript 片段按内容密度合并。"""
+        candidates = self._make_candidates([0, 30000])
+        # 6 条 SRT 片段，每条 1-2 秒，但讲同一话题
+        transcript = self._make_transcript([
+            (0, 2000, "大家好"),
+            (2000, 4000, "这里是智玩先锋"),
+            (4000, 6000, "买数码产品"),
+            (6000, 8000, "我的原则只有一个"),
+            (8000, 10000, "不交智商税"),
+            (10000, 30000, "今天这期是全网最硬核的智能办公本避坑指南"),
+        ])
+        result = generate_pending_segments(candidates, transcript, duration_sec=30)
+        # 前 5 个短片段应合并为 1 个段
+        assert len(result["segments"]) <= 2
+
+    def test_segment_includes_candidate_slide_ids(self):
+        """分段仍记录其时间范围内的候选图 ID。"""
+        candidates = self._make_candidates([5000, 15000, 25000])
+        transcript = self._make_transcript([
+            (0, 30000, "第一段内容。"),
+        ])
+        result = generate_pending_segments(candidates, transcript, duration_sec=30)
+        seg = result["segments"][0]
+        assert len(seg["candidate_slide_ids"]) == 3
