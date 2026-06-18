@@ -366,7 +366,7 @@ def _safe_mermaid(text: str) -> str:
 
 
 def _format_ms(value: int) -> str:
-    seconds = value // 1000
+    seconds = max(0, int(value)) // 1000
     minutes, sec = divmod(seconds, 60)
     hours, minute = divmod(minutes, 60)
     if hours:
