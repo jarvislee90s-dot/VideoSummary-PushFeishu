@@ -173,3 +173,48 @@ class TestTranscriptDrivenSegmentation:
         result = generate_pending_segments(candidates, transcript, duration_sec=30)
         seg = result["segments"][0]
         assert len(seg["candidate_slide_ids"]) == 3
+
+
+class TestMergeTimeRange:
+    """merge 段的时间范围扩展到目标段。"""
+
+    def test_merge_extends_target_end_ms(self):
+        from videotodoc.pipeline import _apply_merge_extensions
+        segments = [
+            {"id": "s01", "start_ms": 0, "end_ms": 30000, "suggested_action": "keep",
+             "candidate_slide_ids": [1], "label": "a"},
+            {"id": "s02", "start_ms": 30000, "end_ms": 35000, "suggested_action": "merge",
+             "merge_into": "s01", "candidate_slide_ids": [2], "label": "b"},
+            {"id": "s03", "start_ms": 35000, "end_ms": 60000, "suggested_action": "keep",
+             "candidate_slide_ids": [3], "label": "c"},
+        ]
+        result = _apply_merge_extensions(segments)
+        s01 = next(s for s in result if s["id"] == "s01")
+        assert s01["end_ms"] == 35000  # 扩展到 s02 的 end_ms
+
+    def test_merge_extends_candidate_slide_ids(self):
+        from videotodoc.pipeline import _apply_merge_extensions
+        segments = [
+            {"id": "s01", "start_ms": 0, "end_ms": 20000, "suggested_action": "keep",
+             "candidate_slide_ids": [1], "label": "a"},
+            {"id": "s02", "start_ms": 20000, "end_ms": 30000, "suggested_action": "merge",
+             "merge_into": "s01", "candidate_slide_ids": [2, 3], "label": "b"},
+        ]
+        result = _apply_merge_extensions(segments)
+        s01 = next(s for s in result if s["id"] == "s01")
+        assert 1 in s01["candidate_slide_ids"]
+        assert 2 in s01["candidate_slide_ids"]
+        assert 3 in s01["candidate_slide_ids"]
+        assert s01["end_ms"] == 30000
+
+    def test_no_merge_segments_unchanged(self):
+        from videotodoc.pipeline import _apply_merge_extensions
+        segments = [
+            {"id": "s01", "start_ms": 0, "end_ms": 30000, "suggested_action": "keep",
+             "candidate_slide_ids": [1], "label": "a"},
+            {"id": "s02", "start_ms": 30000, "end_ms": 60000, "suggested_action": "keep",
+             "candidate_slide_ids": [2], "label": "b"},
+        ]
+        result = _apply_merge_extensions(segments)
+        s01 = next(s for s in result if s["id"] == "s01")
+        assert s01["end_ms"] == 30000  # 不变

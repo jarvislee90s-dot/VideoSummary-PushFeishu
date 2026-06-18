@@ -105,6 +105,22 @@ def capture_video(
 
 
 
+def _apply_merge_extensions(segments: list[dict]) -> list[dict]:
+    """将 merge 段的时间范围扩展到目标段。
+
+    merge 段的 end_ms 设为目标段的新 end_ms，
+    同时将 merge 段的 candidate_slide_ids 合并到目标段。
+    """
+    seg_map = {s["id"]: dict(s) for s in segments}
+    for seg in segments:
+        if seg.get("suggested_action") == "merge" and seg.get("merge_into") in seg_map:
+            target = seg_map[seg["merge_into"]]
+            target["end_ms"] = max(target["end_ms"], seg["end_ms"])
+            target.setdefault("candidate_slide_ids", []).extend(
+                seg.get("candidate_slide_ids", []))
+    return list(seg_map.values())
+
+
 def finalize_video(
     run_dir: Path,
     settings: Settings,
@@ -121,6 +137,9 @@ def finalize_video(
     segments = confirmed.get("segments", [])
     if not segments:
         raise SystemExit("❌ confirmed_segments.json 无分段数据")
+
+    # 扩展 merge 段的时间范围到目标段
+    segments = _apply_merge_extensions(segments)
 
     video_path = Path(confirmed.get("video_path", ""))
 
