@@ -67,7 +67,7 @@ pipeline 会**自动优先使用同目录的 `transcript_merged.json`**（若存
 
 ### ② 截图 + 三段式去重
 
-- 运行 `scripts/process.py`，默认 `--capture-mode audit --fallback-interval-sec 15 --ocr-dedupe`
+- 运行 `scripts/process.py`，默认 `--capture-mode audit --fallback-interval-sec 15`（OCR 去重默认开启，无需显式传；用 `--no-ocr-dedupe` 关闭）
 - 三段式去重：明显重复 → 合并；明显不同 → 保留；不确定 → OCR 判定
 
 ### ③ 图文对齐
@@ -203,7 +203,7 @@ python3 .agents/skills/video-to-slides/scripts/render_mindmap.py runs/<视频标
 | `--transcript` | `None` | 已有转录文件路径（跳过 ASR） |
 | `--capture-mode` | `audit` | 截图模式：fast/fine/audit |
 | `--fallback-interval-sec` | `15` | 兜底截图间隔秒数 |
-| `--ocr-dedupe` | 开启 | 启用 OCR 辅助去重 |
+| `--no-ocr-dedupe` | 关闭 | 关闭 OCR 辅助去重（默认开启） |
 | `--sync-offset-ms` | `None` | 时间偏移修正（毫秒） |
 | `--force-rebuild` | `[]` | 重跑步骤：audio/asr/slides/align/mindmap |
 
@@ -215,7 +215,7 @@ python3 .agents/skills/video-to-slides/scripts/render_mindmap.py runs/<视频标
 2. **明显不同**：`change_ratio >= 0.12` 或 `dHash > 16` → 保留新页
 3. **不确定**：调用 OCR；文本相似度 `>= 0.92` 且变化面积 `< 0.12` → 重复，否则保留
 
-不要对全部候选图全量 OCR。白底 PPT 容易误合并，建议开启 `--ocr-dedupe`。
+不要对全部候选图全量 OCR。白底 PPT 容易误合并，OCR 去重默认开启；如需关闭用 `--no-ocr-dedupe`。
 
 ---
 
