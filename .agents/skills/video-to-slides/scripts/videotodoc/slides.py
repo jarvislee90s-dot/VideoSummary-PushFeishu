@@ -365,11 +365,35 @@ def slides_from_dict(data: dict) -> SlideSet:
 
 
 def _candidate_points(change_points: list[int], duration_ms: int, settings: Settings) -> list[int]:
-    points = list(change_points)
-    if settings.capture_mode in {"fine", "audit", "complete"} and settings.fallback_interval_sec > 0:
-        interval_ms = int(settings.fallback_interval_sec * 1000)
-        points.extend(range(interval_ms, duration_ms, interval_ms))
-    return sorted(point for point in set(points) if 0 < point < duration_ms)
+    """生成候选截图时间点。
+
+    固定间隔决定候选点数量。场景变化点仅在所属间隔窗口内微调
+    capture_ms 到最近的变化时刻，不产生额外候选点。
+    """
+    if settings.capture_mode not in {"fine", "audit", "complete"} or settings.fallback_interval_sec <= 0:
+        return sorted(p for p in change_points if 0 < p < duration_ms)
+
+    interval_ms = int(settings.fallback_interval_sec * 1000)
+    # 纯间隔点
+    interval_points = list(range(interval_ms, duration_ms, interval_ms))
+
+    if not change_points:
+        return interval_points
+
+    # 对每个间隔点，找最近的场景变化点做微调
+    result: list[int] = []
+    for ip in interval_points:
+        window_start = ip - interval_ms
+        window_end = ip + interval_ms
+        # 在 [window_start, window_end) 范围内找最近的场景变化点
+        candidates_in_window = [cp for cp in change_points if window_start <= cp < window_end]
+        if candidates_in_window:
+            best = min(candidates_in_window, key=lambda cp: abs(cp - ip))
+            result.append(best)
+        else:
+            result.append(ip)
+
+    return sorted(set(p for p in result if 0 < p < duration_ms))
 
 
 def _build_boundaries(change_points: list[int], duration_ms: int, min_slide_seconds: float) -> list[tuple[int, int]]:
