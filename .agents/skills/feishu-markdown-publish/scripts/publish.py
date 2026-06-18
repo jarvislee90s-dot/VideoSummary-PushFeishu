@@ -73,17 +73,23 @@ def main() -> int:
         )
         start_index = 1
 
+    total = len(parsed.sections)
     for index, section in enumerate(parsed.sections, start=1):
         if index < start_index:
             continue
-        publisher.append_doc(doc_ref, write_chunk(publish_dir, f"section_{index:03d}_title", ensure_blank(section.title)))
+        # 合并 title + body + divider 为一次 append（API 调用 4N → 2N+1）
+        chunk_parts = [ensure_blank(section.title)]
+        if section.body:
+            chunk_parts.append(ensure_blank(section.body))
+        if index < total:
+            chunk_parts.append("\n\n---\n\n")
+        combined = "\n\n".join(chunk_parts)
+        publisher.append_doc(doc_ref, write_chunk(publish_dir, f"section_{index:03d}", combined))
+        # 图片单独上传
         if section.image:
             publisher.insert_image(doc_ref, section.image, section.caption)
-        if section.body:
-            publisher.append_doc(doc_ref, write_chunk(publish_dir, f"section_{index:03d}_body", ensure_blank(section.body)))
-        if index < len(parsed.sections):
-            publisher.append_doc(doc_ref, write_chunk(publish_dir, f"section_{index:03d}_divider", "\n\n---\n\n"))
         publisher.save_progress(doc_ref, index)
+        print(f"  📤 第 {index}/{total} 页已发布", flush=True)
 
     if parsed.mindmap:
         publisher.append_doc(doc_ref, write_chunk(publish_dir, "mindmap_title", ensure_blank(parsed.mindmap.title)))
