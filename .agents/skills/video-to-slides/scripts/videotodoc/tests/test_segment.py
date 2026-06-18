@@ -22,3 +22,83 @@ class TestCaptureInterval:
 
     def test_boundary_30min(self):
         assert capture_interval_for_duration(1801) == 40
+
+
+from videotodoc.segment import generate_pending_segments, validate_confirmed_segments
+from videotodoc.models import Slide, SlideSet, TranscriptSegment, Transcript
+
+
+class TestGeneratePendingSegments:
+    def _make_candidates(self, times_ms: list[int]) -> SlideSet:
+        return SlideSet(slides=[
+            Slide(slide_index=i + 1, image_path=f"img{i}.png", start_ms=t, end_ms=t + 1000,
+                  capture_ms=t, confidence=0.8, hash="0" * 16, edge_density=0.5)
+            for i, t in enumerate(times_ms)
+        ])
+
+    def _make_transcript(self, segments: list[tuple[int, int, str]]) -> Transcript:
+        return Transcript(
+            backend="test", language="zh",
+            segments=[TranscriptSegment(start_ms=s, end_ms=e, text=t) for s, e, t in segments],
+        )
+
+    def test_basic_segmentation(self):
+        candidates = self._make_candidates([0, 30000, 60000])
+        transcript = self._make_transcript([
+            (0, 30000, "大家好这是开篇介绍。"),
+            (30000, 60000, "接下来讲选购要点。"),
+            (60000, 90000, "最后是产品推荐。"),
+        ])
+        result = generate_pending_segments(candidates, transcript, duration_sec=90)
+        assert len(result["segments"]) >= 2
+        assert result["capture_interval_sec"] == 15
+        assert all("suggested_action" in s for s in result["segments"])
+
+    def test_step_words_force_keep(self):
+        candidates = self._make_candidates([0, 15000, 30000])
+        transcript = self._make_transcript([
+            (0, 15000, "第一步打开设置。"),
+            (15000, 30000, "然后点击导出。"),
+            (30000, 45000, "接下来保存文件。"),
+        ])
+        result = generate_pending_segments(candidates, transcript, duration_sec=45)
+        step_segments = [s for s in result["segments"] if "第一步" in s["transcript_preview"]
+                         or "然后" in s["transcript_preview"] or "接下来" in s["transcript_preview"]]
+        # 含步骤词的段不应被标记为 merge
+        for s in step_segments:
+            assert s["suggested_action"] == "keep"
+
+    def test_long_segment_split(self):
+        long_text = "这是一个很长的讲解。" * 100  # > 400 字
+        candidates = self._make_candidates([0])
+        transcript = self._make_transcript([(0, 120000, long_text)])
+        result = generate_pending_segments(candidates, transcript, duration_sec=120)
+        split_segments = [s for s in result["segments"] if s["suggested_action"] == "split"]
+        assert len(split_segments) >= 1
+
+
+class TestValidateConfirmedSegments:
+    def test_valid_confirmed(self):
+        pending = {
+            "segments": [
+                {"id": "s01", "start_ms": 0, "end_ms": 30000, "label": "开篇",
+                 "suggested_action": "keep", "candidate_slide_ids": [1]},
+                {"id": "s02", "start_ms": 30000, "end_ms": 60000, "label": "要点",
+                 "suggested_action": "merge", "merge_into": "s01", "candidate_slide_ids": [2]},
+            ]
+        }
+        assert validate_confirmed_segments(pending) is True
+
+    def test_merge_without_target(self):
+        pending = {
+            "segments": [
+                {"id": "s01", "start_ms": 0, "end_ms": 30000, "label": "开篇",
+                 "suggested_action": "keep", "candidate_slide_ids": [1]},
+                {"id": "s02", "start_ms": 30000, "end_ms": 60000, "label": "要点",
+                 "suggested_action": "merge", "merge_into": "s99", "candidate_slide_ids": [2]},
+            ]
+        }
+        assert validate_confirmed_segments(pending) is False
+
+    def test_empty_segments(self):
+        assert validate_confirmed_segments({"segments": []}) is False
