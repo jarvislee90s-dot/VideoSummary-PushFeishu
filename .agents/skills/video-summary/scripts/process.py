@@ -279,34 +279,77 @@ def _download_subtitle(url: str, subtitle_list: list, run_dir: Path, title: str,
 
 
 def _parse_subtitle_file(path: Path) -> tuple[str | None, list[dict]]:
-    """解析字幕文件为纯文本"""
-    text = path.read_text(encoding="utf-8")
-    lines = []
-    segments = []
+    """解析字幕文件为纯文本 + 带 start_ms/end_ms 的 segment 列表。
 
+    支持 SRT、VTT（含 --> 时间戳行）和 XML 格式。
+    """
+    import re
+
+    text = path.read_text(encoding="utf-8")
+    lines_list: list[str] = []
+    segments: list[dict] = []
+
+    # SRT / VTT 格式：包含 --> 时间戳行
+    if "-->" in text:
+        # 按空行分块
+        blocks = re.split(r"\n\s*\n", text.strip())
+        for block in blocks:
+            block_lines = block.strip().split("\n")
+            # 找时间戳行
+            tc_line = None
+            text_lines: list[str] = []
+            for line in block_lines:
+                if "-->" in line:
+                    tc_line = line
+                elif line.strip() and not line.strip().isdigit():
+                    # 跳过 WEBVTT 头
+                    if not line.strip().startswith("WEBVTT"):
+                        text_lines.append(line.strip())
+            if tc_line and text_lines:
+                m = re.match(
+                    r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)",
+                    tc_line,
+                )
+                if m:
+                    g = m.groups()
+                    start_ms = int(int(g[0]) * 3600000 + int(g[1]) * 60000 + int(g[2]) * 1000 + int(g[3]))
+                    end_ms = int(int(g[4]) * 3600000 + int(g[5]) * 60000 + int(g[6]) * 1000 + int(g[7]))
+                    seg_text = " ".join(text_lines)
+                    lines_list.append(seg_text)
+                    segments.append({"start_ms": start_ms, "end_ms": end_ms, "text": seg_text})
+        if lines_list:
+            return "\n".join(lines_list), segments
+
+    # XML 格式
     if "<text" in text or "<p" in text:
         import xml.etree.ElementTree as ET
         try:
             root = ET.fromstring(text)
             for elem in root.iter():
                 if elem.text and elem.text.strip():
-                    lines.append(elem.text.strip())
-                    segments.append({"text": elem.text.strip(), "start": None, "end": None})
+                    start_attr = elem.get("start")
+                    dur_attr = elem.get("dur")
+                    start_ms = int(float(start_attr) * 1000) if start_attr else 0
+                    end_ms = start_ms + int(float(dur_attr) * 1000) if (start_ms is not None and dur_attr) else start_ms
+                    lines_list.append(elem.text.strip())
+                    segments.append({"start_ms": start_ms, "end_ms": end_ms, "text": elem.text.strip()})
         except ET.ParseError:
             pass
+        if lines_list:
+            return "\n".join(lines_list), segments
 
-    if not lines:
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.isdigit():
-                continue
-            if "-->" in line or line.startswith("WEBVTT"):
-                continue
-            if line:
-                lines.append(line)
-                segments.append({"text": line, "start": None, "end": None})
+    # 纯文本兜底
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.isdigit():
+            continue
+        if "-->" in line or line.startswith("WEBVTT"):
+            continue
+        if line:
+            lines_list.append(line)
+            segments.append({"start_ms": 0, "end_ms": 0, "text": line})
 
-    return "\n".join(lines) if lines else None, segments
+    return "\n".join(lines_list) if lines_list else None, segments
 
 
 def fetch_subtitles(url: str, run_dir: Path, language: str = "zh") -> tuple[bool, str | None, str | None]:
@@ -630,7 +673,7 @@ def transcribe_audio(audio_path: Path, run_dir: Path, model: str, language: str 
 
 
 def save_subtitle_as_transcript(subtitle_text: str, transcript_json_path: Path, transcript_txt_path: Path, language: str, run_dir: Path | None = None) -> None:
-    """将字幕文本保存为 transcript 格式"""
+    """将字幕文本保存为 transcript 格式（带 segments key 的 dict）。"""
     lines = [line.strip() for line in subtitle_text.splitlines() if line.strip()]
 
     segments = []
@@ -643,9 +686,19 @@ def save_subtitle_as_transcript(subtitle_text: str, transcript_json_path: Path, 
                 pass
 
     if not segments:
-        segments = [{"start": None, "end": None, "text": line} for line in lines]
+        segments = [{"start_ms": 0, "end_ms": 0, "text": line} for line in lines]
 
-    transcript_json_path.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 统一为 start_ms/end_ms 字段名
+    normalized = []
+    for seg in segments:
+        normalized.append({
+            "start_ms": seg.get("start_ms", seg.get("start", 0)) or 0,
+            "end_ms": seg.get("end_ms", seg.get("end", 0)) or 0,
+            "text": seg.get("text", ""),
+        })
+
+    transcript_data = {"segments": normalized, "language": language}
+    transcript_json_path.write_text(json.dumps(transcript_data, ensure_ascii=False, indent=2), encoding="utf-8")
     transcript_txt_path.write_text("\n".join(lines), encoding="utf-8")
 
     print(f"  ✅ 字幕转录完成：{len(lines)} 行")
