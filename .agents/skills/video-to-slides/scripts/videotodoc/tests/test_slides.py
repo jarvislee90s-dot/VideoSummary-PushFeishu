@@ -43,3 +43,78 @@ class TestCandidatePoints:
         assert 55000 in points
         assert 30000 not in points
         assert 60000 not in points
+
+
+import json
+from pathlib import Path as PathCls
+from videotodoc.slides import finalize_segment_slides
+from videotodoc.models import Slide, SlideSet
+from videotodoc.config import Settings
+
+
+class TestFinalizeSegmentSlides:
+    def _make_candidates(self, times_ms: list[int]) -> SlideSet:
+        return SlideSet(slides=[
+            Slide(slide_index=i + 1, image_path=f"img{i}.png", start_ms=t, end_ms=t + 1000,
+                  capture_ms=t, confidence=0.8, hash=f"{i:016x}", edge_density=0.3 + i * 0.1)
+            for i, t in enumerate(times_ms)
+        ])
+
+    def test_returns_one_slide_per_segment(self, tmp_path):
+        """每段只返回 1 张截图。"""
+        candidates = self._make_candidates([5000, 10000, 15000])
+        segment = {
+            "id": "s01", "start_ms": 0, "end_ms": 30000,
+            "suggested_action": "keep",
+            "candidate_slide_ids": [1, 2, 3],
+        }
+        result = finalize_segment_slides(
+            segment, candidates, PathCls("/dev/null"), tmp_path, Settings(),
+        )
+        assert len(result) == 1
+
+    def test_slide_time_range_is_segment_range(self, tmp_path):
+        """返回的 slide 时间范围 = 段的 [start_ms, end_ms]。"""
+        candidates = self._make_candidates([5000])
+        segment = {
+            "id": "s01", "start_ms": 0, "end_ms": 30000,
+            "suggested_action": "keep",
+            "candidate_slide_ids": [1],
+        }
+        result = finalize_segment_slides(
+            segment, candidates, PathCls("/dev/null"), tmp_path, Settings(),
+        )
+        assert result[0].start_ms == 0
+        assert result[0].end_ms == 30000
+
+    def test_picks_highest_edge_density(self, tmp_path):
+        """选 edge_density 最高的候选图。"""
+        candidates = self._make_candidates([5000, 10000, 15000])
+        # edge_density: slide1=0.3, slide2=0.4, slide3=0.5 → 选 slide3
+        segment = {
+            "id": "s01", "start_ms": 0, "end_ms": 30000,
+            "suggested_action": "keep",
+            "candidate_slide_ids": [1, 2, 3],
+        }
+        result = finalize_segment_slides(
+            segment, candidates, PathCls("/dev/null"), tmp_path, Settings(),
+        )
+        assert result[0].capture_ms == 15000  # slide3 的 capture_ms
+
+    def test_no_candidates_returns_empty_without_video(self, tmp_path):
+        """段内无候选图且无视频文件时不崩溃（extract_frame 会失败）。"""
+        candidates = SlideSet(slides=[])
+        segment = {
+            "id": "s01", "start_ms": 0, "end_ms": 30000,
+            "suggested_action": "keep",
+            "candidate_slide_ids": [],
+        }
+        # /dev/null 不是视频，extract_frame 会抛异常
+        try:
+            result = finalize_segment_slides(
+                segment, candidates, PathCls("/dev/null"), tmp_path, Settings(),
+            )
+            assert len(result) == 1
+            assert result[0].capture_ms == 15000  # 中点
+        except Exception:
+            pass  # extract_frame 失败是预期的

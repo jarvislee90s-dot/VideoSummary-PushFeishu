@@ -609,7 +609,14 @@ def finalize_segment_slides(
     output_dir: Path,
     settings: Settings,
 ) -> list[Slide]:
-    """对单个 segment 做段内去重 + 补图，返回最终截图列表。"""
+    """对单个 segment 选 1 张最佳截图，返回 [Slide]。
+
+    选择策略：
+    1. 段内有候选图 → 选 edge_density 最高的（信息量最大）
+    2. 段内无候选图 → 段中点快速补一帧
+    slide 的时间范围设为段的 [start_ms, end_ms]，
+    使 align_sections 将段内所有 transcript 文字归到这一页。
+    """
     seg_start = segment["start_ms"]
     seg_end = segment["end_ms"]
     slide_ids = set(segment.get("candidate_slide_ids", []))
@@ -617,71 +624,34 @@ def finalize_segment_slides(
     # 取该 segment 的候选图
     seg_candidates = [s for s in candidates.slides if s.slide_index in slide_ids]
 
-    # 段内去重（复用三段式逻辑，范围收敛到段内）
-    kept: list[Slide] = []
-    dedupe_stats = DedupeStats()
-    for slide in seg_candidates:
-        if kept and is_near_duplicate(
-            Path(slide.image_path), Path(kept[-1].image_path),
-            settings.hash_threshold, settings, dedupe_stats,
-        ):
-            # 重复：保留后一张（信息更完整）
-            kept[-1] = slide
-            continue
-        kept.append(slide)
+    if seg_candidates:
+        # 选 edge_density 最高的候选图
+        best = max(seg_candidates, key=lambda s: s.edge_density or 0.0)
+        return [Slide(
+            slide_index=1,
+            image_path=best.image_path,
+            start_ms=seg_start,
+            end_ms=seg_end,
+            capture_ms=best.capture_ms,
+            confidence=best.confidence,
+            hash=best.hash,
+            edge_density=best.edge_density,
+        )]
 
-    # 补图 case 1：0 张图 → 段中点快速补一帧
-    if not kept:
-        mid_ms = (seg_start + seg_end) // 2
-        img_path = output_dir / f"fill_{segment['id']}_mid.png"
-        extract_frame(video_path, mid_ms, img_path, precise=False)
-        kept.append(Slide(
-            slide_index=0, image_path=str(img_path), start_ms=seg_start, end_ms=seg_end,
-            capture_ms=mid_ms, confidence=0.6, hash=f"{dhash(img_path):016x}",
-            edge_density=edge_density(img_path),
-        ))
-
-    # 补图 case 2：有图但存在无图覆盖区间 → 末尾时刻补一帧
-    if kept:
-        gap_start = seg_start
-        for s in sorted(kept, key=lambda x: x.capture_ms):
-            if s.capture_ms - gap_start > 5000:  # 无图区间 > 5s
-                fill_ms = s.capture_ms - 500  # 该区间末尾
-                img_path = output_dir / f"fill_{segment['id']}_{fill_ms}.png"
-                extract_frame(video_path, fill_ms, img_path, precise=False)
-                kept.append(Slide(
-                    slide_index=0, image_path=str(img_path), start_ms=gap_start,
-                    end_ms=s.capture_ms, capture_ms=fill_ms, confidence=0.6,
-                    hash=f"{dhash(img_path):016x}", edge_density=edge_density(img_path),
-                ))
-            gap_start = s.capture_ms
-        # 末尾无图区间
-        if seg_end - gap_start > 5000:
-            fill_ms = seg_end - 500
-            img_path = output_dir / f"fill_{segment['id']}_end.png"
-            extract_frame(video_path, fill_ms, img_path, precise=False)
-            kept.append(Slide(
-                slide_index=0, image_path=str(img_path), start_ms=gap_start, end_ms=seg_end,
-                capture_ms=fill_ms, confidence=0.6, hash=f"{dhash(img_path):016x}",
-                edge_density=edge_density(img_path),
-            ))
-
-    # 补图后重新跑一次段内去重
-    if len(kept) > 1:
-        re_kept: list[Slide] = [kept[0]]
-        for slide in kept[1:]:
-            if is_near_duplicate(
-                Path(slide.image_path), Path(re_kept[-1].image_path),
-                settings.hash_threshold, settings, DedupeStats(),
-            ):
-                continue
-            re_kept.append(slide)
-        kept = re_kept
-
-    # 重新编号
-    for i, s in enumerate(kept, start=1):
-        s.slide_index = i
-    return kept
+    # 段内无候选图 → 中点补一帧
+    mid_ms = (seg_start + seg_end) // 2
+    img_path = output_dir / f"fill_{segment['id']}_mid.png"
+    extract_frame(video_path, mid_ms, img_path, precise=False)
+    return [Slide(
+        slide_index=1,
+        image_path=str(img_path),
+        start_ms=seg_start,
+        end_ms=seg_end,
+        capture_ms=mid_ms,
+        confidence=0.6,
+        hash=f"{dhash(img_path):016x}",
+        edge_density=edge_density(img_path),
+    )]
 
 
 def cross_segment_dedupe(segments_slides: list[list[Slide]], settings: Settings) -> None:
