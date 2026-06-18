@@ -556,7 +556,8 @@ def download_video(url: str, run_dir: Path, title: str | None = None, proxy: str
                     cookies_from_browser: str | None = None) -> Path:
     """下载视频到 run 目录
 
-    cookies_from_browser: B站 412 时从浏览器读取 cookies（chrome/firefox/safari/edge）
+    cookies_from_browser: 浏览器 cookies 来源（默认 chrome）；仅对 B站 注入以过风控，
+        非 B站 平台不注入避免回归
     """
     import yt_dlp
 
@@ -596,7 +597,8 @@ def download_video(url: str, run_dir: Path, title: str | None = None, proxy: str
     }
     if proxy:
         ydl_opts["proxy"] = proxy
-    if cookies_from_browser:
+    # 仅对 B站 注入浏览器 cookies（非 B站 平台避免误注入导致回归）
+    if cookies_from_browser and _is_bilibili_url(url):
         ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
