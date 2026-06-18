@@ -68,18 +68,14 @@ def generate_pending_segments(
             "text": seg.text,
         })
 
-    # 合并相邻片段：仅合并真正的碎片（< 10 字），不因相似度合并完整句
-    FRAGMENT_CHARS = 10
+    # 合并相邻片段：只要合并后不超过 max_segment_chars 就合并
+    # 步骤词只影响 suggested_action 标签，不影响实际合并
     merged: list[dict] = []
     for seg in raw_segments:
         if merged:
             prev = merged[-1]
             combined_text = prev["text"] + seg["text"]
-            is_fragment = (
-                len(seg["text"]) < FRAGMENT_CHARS
-                and not _has_step_words(seg["text"])
-            )
-            if is_fragment and len(combined_text) <= max_segment_chars:
+            if len(combined_text) <= max_segment_chars:
                 prev["end_ms"] = seg["end_ms"]
                 prev["text"] = combined_text
                 continue

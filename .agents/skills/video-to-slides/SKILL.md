@@ -33,10 +33,12 @@ capture → review-segments(agent 介入) → finalize
 - agent 审查 pending_segments.json，修改 suggested_action（keep/merge/split）
 - 确认后写 confirmed_segments.json
 
-### finalize：段内去重 + 补图 + 产物
-- 按 confirmed 分段做段内去重（三段式：change_ratio/dHash/OCR）
-- 无图段补图（末尾时刻快速 seek）
-- 跨段边界去重
+### finalize：每段选 1 张最佳截图 + 补图 + 产物
+- 每段选 edge_density 最高的候选图作为该段唯一截图
+- slide 时间范围设为段的 [start_ms, end_ms]，使 align_sections 将段内所有 transcript 文字归到这一页
+- 无候选图的段在段中点补一帧
+- merge 段时间范围自动扩展到目标段
+- 跨段边界去重（仅相邻段）
 - 生成 Markdown/Word/思维导图
 
 ---
