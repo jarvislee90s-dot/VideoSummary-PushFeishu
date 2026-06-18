@@ -69,21 +69,21 @@ description: "将本地 VideoToDoc Markdown 文档发布到飞书云文档。触
 
 ```bash
 # 发布到公共文档
-python3 skills/feishu-markdown-publish/scripts/publish.py \
+python3 .agents/skills/feishu-markdown-publish/scripts/publish.py \
   runs/<视频标题>_<时间戳>/<视频标题>_讲义_整理版_<时间戳>.md
 
 # 发布到指定知识库
-python3 skills/feishu-markdown-publish/scripts/publish.py \
+python3 .agents/skills/feishu-markdown-publish/scripts/publish.py \
   runs/<视频标题>_<时间戳>/<视频标题>_讲义_整理版_<时间戳>.md \
   "https://example.feishu.cn/wiki/space/<space_id>"
 
 # 只传 space_id
-python3 skills/feishu-markdown-publish/scripts/publish.py \
+python3 .agents/skills/feishu-markdown-publish/scripts/publish.py \
   runs/<视频标题>_<时间戳>/<视频标题>_讲义_整理版_<时间戳>.md \
   7641581418232957895
 
 # Dry-run 检查
-python3 skills/feishu-markdown-publish/scripts/publish.py \
+python3 .agents/skills/feishu-markdown-publish/scripts/publish.py \
   runs/<视频标题>_<时间戳>/<视频标题>_讲义_整理版_<时间戳>.md --dry-run
 ```
 

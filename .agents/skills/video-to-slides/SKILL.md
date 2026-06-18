@@ -180,15 +180,15 @@ python3 scripts/restore_images.py \
 ```bash
 # 标准流程（需要已有视频和转录）
 # 注意：video-summary 下载的视频文件名是 <视频标题>.mp4，不是 video.mp4
-python3 skills/video-to-slides/scripts/process.py "/path/to/<视频标题>.mp4"
+python3 .agents/skills/video-to-slides/scripts/process.py "/path/to/<视频标题>.mp4"
 
 # 指定已有转录（推荐：从 video-summary 产物直接引用）
-python3 skills/video-to-slides/scripts/process.py \
+python3 .agents/skills/video-to-slides/scripts/process.py \
   "runs/<视频标题>_<时间戳>/<视频标题>.mp4" \
   --transcript "runs/<视频标题>_<时间戳>/transcript.json"
 
 # 手工修改思维导图后刷新
-python3 skills/video-to-slides/scripts/render_mindmap.py runs/<视频标题>_<时间戳>
+python3 .agents/skills/video-to-slides/scripts/render_mindmap.py runs/<视频标题>_<时间戳>
 ```
 
 ---
