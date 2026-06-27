@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .align import align_sections
@@ -80,8 +81,10 @@ def capture_video(
     slides_dir = run_dir / f"slides_{slides_slug}"
     slides_path = cache_dir / f"{video_hash}_{slides_slug}.candidates.json"
 
-    # 步骤 1-2：音频 + ASR
+    # 步骤 1：提取音频
     audio = extract_audio(video_path, audio_path, settings, force=_stage_forced(force_rebuild, "audio"))
+
+    # 步骤 2-3 并行：ASR 转录 + 截图检测（skip_dedupe）
     if settings.transcript_path:
         tpath = Path(settings.transcript_path)
         merged_path = tpath.parent / "transcript_merged.json"
@@ -89,15 +92,21 @@ def capture_video(
         if merged_path.exists():
             print(f"  ♻️  使用已合并转录：{merged_path.name}")
         transcript = _transcript_from_external(read_json(source_path), settings.language)
-        # 写入 cache 供 finalize 阶段读取
         write_json(transcript_path, to_plain_dict(transcript))
         print(f"  ♻️  复用已有转录（{len(transcript.segments)} 段）")
+        candidates = detect_slides(video_path, slides_dir, slides_path, settings,
+                                   force=_stage_forced(force_rebuild, "slides"), skip_dedupe=True)
     else:
-        transcript = transcribe_audio(audio, transcript_path, settings, force=_stage_forced(force_rebuild, "asr"))
-
-    # 步骤 3：截图（skip_dedupe，只生成候选）
-    candidates = detect_slides(video_path, slides_dir, slides_path, settings,
-                               force=_stage_forced(force_rebuild, "slides"), skip_dedupe=True)
+        def _run_asr():
+            return transcribe_audio(audio, transcript_path, settings, force=_stage_forced(force_rebuild, "asr"))
+        def _run_detect():
+            return detect_slides(video_path, slides_dir, slides_path, settings,
+                                 force=_stage_forced(force_rebuild, "slides"), skip_dedupe=True)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f_asr = executor.submit(_run_asr)
+            f_detect = executor.submit(_run_detect)
+            transcript = f_asr.result()
+            candidates = f_detect.result()
 
     # 步骤 4：生成分段草案
     pending = generate_pending_segments(candidates, transcript, duration_sec,
@@ -213,12 +222,28 @@ def finalize_video(
     fill_dir = run_dir / "fill_slides"
     fill_dir.mkdir(parents=True, exist_ok=True)
 
-    all_slides: list[list[Slide]] = []
-    for seg in segments:
+    seg_tasks: list[tuple[int, dict]] = []
+    for seg_idx, seg in enumerate(segments):
         if seg["suggested_action"] == "merge":
-            continue  # 合并段跳过，内容归到 merge_into
-        seg_slides = finalize_segment_slides(seg, candidates, video_path, fill_dir, settings)
-        all_slides.append(seg_slides)
+            continue
+        seg_tasks.append((seg_idx, seg))
+
+    all_slides_by_idx: dict[int, list[Slide]] = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        def _finalize_seg(task: tuple[int, dict]) -> tuple[int, list[Slide]]:
+            idx, seg = task
+            result = finalize_segment_slides(seg, candidates, video_path, fill_dir, settings)
+            return (idx, result)
+        futures = {executor.submit(_finalize_seg, t): t[0] for t in seg_tasks}
+        for future in as_completed(futures):
+            idx, seg_slides = future.result()
+            all_slides_by_idx[idx] = seg_slides
+
+    all_slides: list[list[Slide]] = []
+    for seg_idx, seg in enumerate(segments):
+        if seg["suggested_action"] == "merge":
+            continue
+        all_slides.append(all_slides_by_idx[seg_idx])
 
     # 跨段边界去重
     cross_segment_dedupe(all_slides, settings)
@@ -259,19 +284,49 @@ def finalize_video(
     mindmap_path = run_dir / f"{slug}_思维导图_{ts}.mmd"
     mindmap_image_path = run_dir / f"{slug}_思维导图_{ts}.png"
 
-    mindmap = generate_mindmap(slug, sections, mindmap_path, settings)
-    if not mindmap_image_path.exists():
-        temp_mindmap = run_dir / "mindmap.mmd"
-        if not temp_mindmap.exists():
-            temp_mindmap.symlink_to(mindmap_path.name)
-        render_mindmap_and_refresh_docs(run_dir, mindmap_path=mindmap_path, image_path=mindmap_image_path)
+    def _render_mindmap():
+        generate_mindmap(slug, sections, mindmap_path, settings)
+        if not mindmap_image_path.exists():
+            temp_mindmap = run_dir / "mindmap.mmd"
+            if not temp_mindmap.exists():
+                temp_mindmap.symlink_to(mindmap_path.name)
+            render_mindmap_and_refresh_docs(run_dir, mindmap_path=mindmap_path, image_path=mindmap_image_path)
+        return mindmap_image_path.exists()
+
+    def _render_original_md():
+        render_original_markdown(slug, sections, markdown_path)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        f_mindmap = executor.submit(_render_mindmap)
+        f_orig_md = executor.submit(_render_original_md)
+        f_mindmap.result()
+        f_orig_md.result()
 
     mm_image = mindmap_image_path if mindmap_image_path.exists() else None
-    render_original_markdown(slug, sections, markdown_path)
-    render_compact_markdown(slug, sections, compact_markdown_path, mm_image)
-    ensure_semantic_markdown(slug, sections, semantic_markdown_path, mm_image)
-    markdown_to_docx(compact_markdown_path, docx_path)
-    markdown_to_docx(semantic_markdown_path, semantic_docx_path)
+
+    def _render_compact_md():
+        render_compact_markdown(slug, sections, compact_markdown_path, mm_image)
+
+    def _render_semantic_md():
+        ensure_semantic_markdown(slug, sections, semantic_markdown_path, mm_image)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f_compact = executor.submit(_render_compact_md)
+        f_semantic = executor.submit(_render_semantic_md)
+        f_compact.result()
+        f_semantic.result()
+
+    def _convert_compact_docx():
+        markdown_to_docx(compact_markdown_path, docx_path)
+
+    def _convert_semantic_docx():
+        markdown_to_docx(semantic_markdown_path, semantic_docx_path)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f_docx1 = executor.submit(_convert_compact_docx)
+        f_docx2 = executor.submit(_convert_semantic_docx)
+        f_docx1.result()
+        f_docx2.result()
 
     return {
         "run_dir": str(run_dir.resolve()),
@@ -328,7 +383,7 @@ def process_video(
     # 步骤 1：提取音频
     audio = extract_audio(video_path, audio_path, settings, force=_stage_forced(force_rebuild, "audio"))
 
-    # 步骤 2：ASR 转录（必须在截图裁剪之前完成）
+    # 步骤 2-3 并行：ASR 转录 + 候选截图检测
     if settings.transcript_path:
         tpath = Path(settings.transcript_path)
         merged_path = tpath.parent / "transcript_merged.json"
@@ -337,15 +392,25 @@ def process_video(
             print(f"  ♻️  使用已合并转录：{merged_path.name}")
         transcript = _transcript_from_external(read_json(source_path), settings.language)
         print(f"  ♻️  转录段数：{len(transcript.segments)}")
+        candidates = detect_slides(
+            video_path, slides_dir, slides_path, settings,
+            force=_stage_forced(force_rebuild, "slides"),
+            skip_dedupe=True,
+        )
     else:
-        transcript = transcribe_audio(audio, transcript_path, settings, force=_stage_forced(force_rebuild, "asr"))
-
-    # 步骤 3：生成候选截图（skip_dedupe=True，只生成候选图不做去重）
-    candidates = detect_slides(
-        video_path, slides_dir, slides_path, settings,
-        force=_stage_forced(force_rebuild, "slides"),
-        skip_dedupe=True,
-    )
+        def _run_asr_pv():
+            return transcribe_audio(audio, transcript_path, settings, force=_stage_forced(force_rebuild, "asr"))
+        def _run_detect_pv():
+            return detect_slides(
+                video_path, slides_dir, slides_path, settings,
+                force=_stage_forced(force_rebuild, "slides"),
+                skip_dedupe=True,
+            )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f_asr_pv = executor.submit(_run_asr_pv)
+            f_detect_pv = executor.submit(_run_detect_pv)
+            transcript = f_asr_pv.result()
+            candidates = f_detect_pv.result()
 
     # 步骤 4：按 ASR 段裁剪候选图（同段多图只留最后一张）
     trimmed = trim_candidates_by_transcript(
@@ -363,7 +428,9 @@ def process_video(
 
     # 步骤 7：图文对齐
     if sections_path.exists() and not _stage_forced(force_rebuild, "align"):
-        sections = sections_from_dict(read_json(sections_path))
+        sections_data = read_json(sections_path)
+        sections = sections_from_dict(sections_data)
+        sync_offset_ms = int(sections_data.get("sync_offset_ms", 0))
     else:
         sync_offset_ms = estimate_sync_offset_ms(audio, slides, transcript, settings)
         sections = align_sections(slides, transcript, sync_offset_ms)
@@ -375,34 +442,64 @@ def process_video(
             },
         )
 
-    sync_offset_ms = int(read_json(sections_path).get("sync_offset_ms", 0))
-    mindmap = generate_mindmap(video_path.stem, sections, mindmap_path, settings)
+    def _render_mindmap_pv():
+        generate_mindmap(video_path.stem, sections, mindmap_path, settings)
+        if not mindmap_image_path.exists() or _stage_forced(force_rebuild, "mindmap"):
+            temp_mindmap = run_dir / "mindmap.mmd"
+            if not temp_mindmap.exists():
+                temp_mindmap.symlink_to(mindmap_path.name)
+            render_mindmap_and_refresh_docs(run_dir, mindmap_path=mindmap_path, image_path=mindmap_image_path)
+        return mindmap_image_path.exists()
 
-    # 步骤 8：渲染思维导图 PNG（必须在生成 Markdown/Word 之前）
-    if not mindmap_image_path.exists() or _stage_forced(force_rebuild, "mindmap"):
-        # 创建临时 symlink 让 render_mindmap_and_refresh_docs 找到文件
-        temp_mindmap = run_dir / "mindmap.mmd"
-        if not temp_mindmap.exists():
-            temp_mindmap.symlink_to(mindmap_path.name)
-        render_mindmap_and_refresh_docs(run_dir, mindmap_path=mindmap_path, image_path=mindmap_image_path)
+    def _render_original_md_pv():
+        render_original_markdown(video_path.stem, sections, markdown_path)
 
-    mm_image = mindmap_image_path if mindmap_image_path.exists() else None
-    render_original_markdown(video_path.stem, sections, markdown_path)
-    render_compact_markdown(
-        video_path.stem,
-        sections,
-        compact_markdown_path,
-        mm_image,
-    )
-    ensure_semantic_markdown(
-        video_path.stem,
-        sections,
-        semantic_markdown_path,
-        mm_image,
-    )
-    generated_docx = markdown_to_docx(compact_markdown_path, docx_path)
-    generated_semantic_docx = markdown_to_docx(semantic_markdown_path, semantic_docx_path)
-    write_quality_report(quality_report_path, transcript, slides, sections, sync_offset_ms)
+    def _write_quality_report_pv():
+        write_quality_report(quality_report_path, transcript, slides, sections, sync_offset_ms)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        f_mindmap_pv = executor.submit(_render_mindmap_pv)
+        f_orig_md_pv = executor.submit(_render_original_md_pv)
+        f_quality_pv = executor.submit(_write_quality_report_pv)
+        mindmap_ok = f_mindmap_pv.result()
+        f_orig_md_pv.result()
+        f_quality_pv.result()
+
+    mm_image = mindmap_image_path if mindmap_ok else None
+
+    def _render_compact_md_pv():
+        render_compact_markdown(
+            video_path.stem,
+            sections,
+            compact_markdown_path,
+            mm_image,
+        )
+
+    def _render_semantic_md_pv():
+        ensure_semantic_markdown(
+            video_path.stem,
+            sections,
+            semantic_markdown_path,
+            mm_image,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f_compact_pv = executor.submit(_render_compact_md_pv)
+        f_semantic_pv = executor.submit(_render_semantic_md_pv)
+        f_compact_pv.result()
+        f_semantic_pv.result()
+
+    def _convert_compact_docx_pv():
+        return markdown_to_docx(compact_markdown_path, docx_path)
+
+    def _convert_semantic_docx_pv():
+        return markdown_to_docx(semantic_markdown_path, semantic_docx_path)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f_docx1_pv = executor.submit(_convert_compact_docx_pv)
+        f_docx2_pv = executor.submit(_convert_semantic_docx_pv)
+        generated_docx = f_docx1_pv.result()
+        generated_semantic_docx = f_docx2_pv.result()
 
     return ProcessResult(
         run_dir=run_dir,
