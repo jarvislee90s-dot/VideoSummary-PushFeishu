@@ -289,7 +289,10 @@ def finalize_video(
         if not mindmap_image_path.exists():
             temp_mindmap = run_dir / "mindmap.mmd"
             if not temp_mindmap.exists():
-                temp_mindmap.symlink_to(mindmap_path.name)
+                try:
+                    temp_mindmap.symlink_to(mindmap_path.name)
+                except OSError:
+                    shutil.copy2(mindmap_path, temp_mindmap)
             render_mindmap_and_refresh_docs(run_dir, mindmap_path=mindmap_path, image_path=mindmap_image_path)
         return mindmap_image_path.exists()
 
@@ -447,7 +450,10 @@ def process_video(
         if not mindmap_image_path.exists() or _stage_forced(force_rebuild, "mindmap"):
             temp_mindmap = run_dir / "mindmap.mmd"
             if not temp_mindmap.exists():
-                temp_mindmap.symlink_to(mindmap_path.name)
+                try:
+                    temp_mindmap.symlink_to(mindmap_path.name)
+                except OSError:
+                    shutil.copy2(mindmap_path, temp_mindmap)
             render_mindmap_and_refresh_docs(run_dir, mindmap_path=mindmap_path, image_path=mindmap_image_path)
         return mindmap_image_path.exists()
 

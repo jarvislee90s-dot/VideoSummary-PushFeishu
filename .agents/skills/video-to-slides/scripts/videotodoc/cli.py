@@ -29,6 +29,9 @@ def main(argv: list[str] | None = None) -> int:
     except VideoToDocError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
 
 
 def build_parser() -> argparse.ArgumentParser:

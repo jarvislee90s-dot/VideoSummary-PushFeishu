@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import re
 import shutil
+import sys
 from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from .utils import run_command
+
+
+_rapidocr_engine_instance: Any = ...
+_rapidocr_tried: bool = False
 
 
 def ocr_available() -> bool:
@@ -27,7 +32,8 @@ def extract_text(image_path: str) -> str:
         return normalize_ocr_text(text)
     try:
         result = run_command(["tesseract", image_path, "stdout", "-l", "chi_sim+eng", "--psm", "6"], timeout=30)
-    except Exception:
+    except Exception as e:
+        print(f"[warn] OCR (tesseract) 失败: {e}", file=sys.stderr)
         return ""
     return normalize_ocr_text(result.stdout)
 
@@ -51,14 +57,18 @@ def _rapidocr_available() -> bool:
         return False
 
 
-@lru_cache(maxsize=1)
 def _rapidocr_engine() -> Any | None:
+    global _rapidocr_engine_instance, _rapidocr_tried
+    if _rapidocr_tried:
+        return _rapidocr_engine_instance
+    _rapidocr_tried = True
     try:
         from rapidocr import RapidOCR  # type: ignore
-
-        return RapidOCR()
-    except Exception:
-        return None
+        _rapidocr_engine_instance = RapidOCR()
+    except Exception as e:
+        print(f"[warn] RapidOCR 初始化失败: {e}", file=sys.stderr)
+        _rapidocr_engine_instance = None
+    return _rapidocr_engine_instance
 
 
 def _extract_text_rapidocr(image_path: str) -> str:
@@ -67,7 +77,8 @@ def _extract_text_rapidocr(image_path: str) -> str:
         return ""
     try:
         result = engine(image_path)
-    except Exception:
+    except Exception as e:
+        print(f"[warn] RapidOCR 识别失败: {e}", file=sys.stderr)
         return ""
     return _rapidocr_result_to_text(result)
 

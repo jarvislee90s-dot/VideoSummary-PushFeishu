@@ -380,7 +380,7 @@ def _generate_mindmap_with_openai(title: str, sections: list[Section], settings:
 内容：
 {body}
 """
-    client = OpenAI()
+    client = OpenAI(timeout=60)
     response = client.chat.completions.create(
         model=settings.mindmap_model,
         messages=[

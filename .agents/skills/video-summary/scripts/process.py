@@ -358,12 +358,13 @@ def _parse_subtitle_file(path: Path) -> tuple[str | None, list[dict]]:
     return "\n".join(lines_list) if lines_list else None, segments
 
 
-def fetch_subtitles(url: str, run_dir: Path, language: str = "zh") -> tuple[bool, str | None, str | None]:
+def fetch_subtitles(url: str, run_dir: Path, language: str = "zh", info: dict | None = None) -> tuple[bool, str | None, str | None]:
     """获取平台字幕，返回 (成功, 字幕文本, 视频标题)"""
     import yt_dlp
 
     try:
-        info = fetch_video_info(url)
+        if info is None:
+            info = fetch_video_info(url)
     except Exception as e:
         print(f"  ⚠️  获取视频信息失败：{e}")
         return False, None, None
@@ -499,9 +500,12 @@ def _bilibili_extract_ids(url: str) -> tuple[str | None, str | None, str | None]
 def _download_stream(url: str, tmp_path: Path, headers: dict) -> None:
     from curl_cffi import requests as cffi_requests
     r = cffi_requests.get(url, headers=headers, impersonate="chrome", timeout=120, stream=True)
-    with open(tmp_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 256):
-            f.write(chunk)
+    try:
+        with open(tmp_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                f.write(chunk)
+    finally:
+        r.close()
 
 
 def _bilibili_download(url: str, run_dir: Path, title: str | None = None,
@@ -755,10 +759,11 @@ def cmd_process(args: argparse.Namespace) -> None:
 
     # 先获取标题（URL输入时）
     title = None
+    video_info = None
     if is_url:
         try:
-            info = fetch_video_info(user_input)
-            title = info.get("title")
+            video_info = fetch_video_info(user_input)
+            title = video_info.get("title")
         except Exception:
             pass
 
@@ -780,7 +785,7 @@ def cmd_process(args: argparse.Namespace) -> None:
         print(f"📝 视频标题：{title}")
 
         print("\n🔤 尝试获取平台字幕...")
-        has_subtitle, subtitle_text, fetched_title = fetch_subtitles(user_input, run_dir, args.language)
+        has_subtitle, subtitle_text, fetched_title = fetch_subtitles(user_input, run_dir, args.language, info=video_info)
 
         if fetched_title:
             title = fetched_title
