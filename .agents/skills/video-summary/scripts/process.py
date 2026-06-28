@@ -571,6 +571,27 @@ def download_video(url: str, run_dir: Path, title: str | None = None, proxy: str
     """
     import yt_dlp
 
+    def _prefetch_cookies_for_yt_dlp(site_url: str) -> str | None:
+        """用 curl_cffi 先访问目标站点获取指纹 cookies，写入 Netscape cookie 文件供 yt-dlp 使用。"""
+        try:
+            from curl_cffi import requests as cffi_requests
+            s = cffi_requests.Session(impersonate="chrome")
+            s.get(site_url, timeout=15)
+            if not s.cookies:
+                return None
+            cookie_file = run_dir / "_prefetched.cookies"
+            with open(cookie_file, "w") as f:
+                f.write("# Netscape HTTP Cookie File\n")
+                for c in s.cookies:
+                    secure = "TRUE" if getattr(c, "secure", False) else "FALSE"
+                    domain = getattr(c, "domain", "") or ".douyin.com"
+                    path = getattr(c, "path", "/") or "/"
+                    expires = str(int(getattr(c, "expires", 0)) or 0)
+                    f.write(f"{domain}\tTRUE\t{path}\t{secure}\t{expires}\t{c.name}\t{c.value}\n")
+            return str(cookie_file)
+        except Exception:
+            return None
+
     # B站优先使用 curl_cffi 绕过 412
     if _is_bilibili_url(url):
         try:
@@ -585,15 +606,13 @@ def download_video(url: str, run_dir: Path, title: str | None = None, proxy: str
                     v_url2, a_url2, is_v2 = _bilibili_get_stream_urls_with_cookies(bvid, cid)
                     if not is_v2 and v_url2:
                         return _bilibili_download(url, run_dir, title, stream_urls=(v_url2, a_url2))
-                print("  ❌  该视频触发B站风控，需登录态。请用 --cookies-from-browser chrome 重试，或在浏览器登录B站。")
-                raise RuntimeError("BILI_V_VOUCHER_NEED_LOGIN")
-            if v_url:
+                    print(f"  ⚠️  curl_cffi 带cookies仍触发v_voucher，回退到 yt-dlp（使用浏览器cookies）...")
+                else:
+                    print("  ❌  该视频触发B站风控，需登录态。回退到 yt-dlp 尝试...")
+            if v_url and not is_v_voucher:
                 # 复用已获取的流 URL，不再重复请求 playurl
                 return _bilibili_download(url, run_dir, title, stream_urls=(v_url, a_url))
             print("  ⚠️  curl_cffi 未获取视频流，回退到 yt-dlp...")
-        except RuntimeError as e:
-            if "BILI_V_VOUCHER_NEED_LOGIN" in str(e):
-                raise
         except Exception as e:
             print(f"  ⚠️  curl_cffi 下载失败（{e}），回退到 yt-dlp...")
 
@@ -607,9 +626,15 @@ def download_video(url: str, run_dir: Path, title: str | None = None, proxy: str
     }
     if proxy:
         ydl_opts["proxy"] = proxy
-    # 仅对 B站 注入浏览器 cookies（非 B站 平台避免误注入导致回归）
-    if cookies_from_browser and _is_bilibili_url(url):
+    if cookies_from_browser:
         ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
+    if not _is_bilibili_url(url):
+        prefetched = _prefetch_cookies_for_yt_dlp("https://www.douyin.com/" if "douyin" in url else ("https://www.xiaohongshu.com/" if "xiaohongshu" in url or "xhslink" in url else None))
+        if prefetched:
+            if "cookiefile" in ydl_opts:
+                pass
+            else:
+                ydl_opts["cookiefile"] = prefetched
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -743,6 +768,16 @@ def cleanup(run_dir: Path, mode: str) -> None:
 # ── 主流程 ────────────────────────────────────────────────────
 
 
+def _print_merge_hint(transcript_json_path: Path) -> None:
+    """ASR 完成后提示 Agent 执行步骤6（合并碎段），不可跳过。"""
+    print(
+        f"\n⚠️  下一步必做（SKILL.md 步骤6）：合并 ASR 碎段，不可跳过：\n"
+        f"    python3 .agents/skills/video-summary/scripts/prepare_merge.py {transcript_json_path}\n"
+        f"    # 然后读取 merge_input.json，按语义合并写 merged_groups.json\n"
+        f"    python3 .agents/skills/video-summary/scripts/apply_merge.py {transcript_json_path} <run_dir>/merged_groups.json"
+    )
+
+
 def cmd_process(args: argparse.Namespace) -> None:
     """主流程：URL/本地路径 → 字幕优先 → ASR fallback → 输出"""
     user_input = args.input
@@ -798,6 +833,7 @@ def cmd_process(args: argparse.Namespace) -> None:
                                         cookies_from_browser=getattr(args, 'cookies_from_browser', None))
             audio_path = extract_audio(video_path, run_dir)
             transcribe_audio(audio_path, run_dir, args.asr_model, args.language)
+            _print_merge_hint(transcript_json_path)
 
     else:
         video_path = Path(user_input).expanduser().resolve()
@@ -820,6 +856,7 @@ def cmd_process(args: argparse.Namespace) -> None:
 
         audio_path = extract_audio(run_video, run_dir)
         transcribe_audio(audio_path, run_dir, args.asr_model, args.language)
+        _print_merge_hint(transcript_json_path)
 
     # 生成最终摘要文件：视频标题_总结_时间戳.md
     summary_path = run_dir / _build_summary_filename(title, ts)
