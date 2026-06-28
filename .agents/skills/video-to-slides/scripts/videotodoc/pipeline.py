@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -31,6 +32,15 @@ from .segment import capture_interval_for_duration, generate_pending_segments
 from .sync import estimate_sync_offset_ms
 from datetime import datetime
 from .utils import VideoToDocError, ensure_file, file_md5, slugify, seconds_to_ms
+
+
+def _title_from_run_dir(run_dir: Path) -> str | None:
+    """从复用的 run_dir 名推断视频标题，去掉时间戳后缀。"""
+    stem = run_dir.name
+    m = re.search(r"(.+)_\d{8}_\d{6}$", stem)
+    if m:
+        return m.group(1)
+    return stem
 
 
 def _transcript_from_external(data: object, language: str) -> "Transcript":
@@ -347,12 +357,17 @@ def process_video(
     ensure_file(video_path, "视频文件")
     force_rebuild = force_rebuild or set()
 
-    # slug/ts 仍用于后续产物文件名；run_dir 外部传入优先（复用 video-summary 目录）
-    slug = slugify(video_path.stem)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # run_dir 外部传入时（复用 video-summary 目录），优先从 run_dir 名推断标题
     if run_dir is not None:
         run_dir = run_dir.resolve()
+        title = _title_from_run_dir(run_dir)
     else:
+        title = None
+
+    # slug/ts 仍用于后续产物文件名
+    slug = slugify(title or video_path.stem)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if run_dir is None:
         run_dir = runs_dir / f"{slug}_{ts}"
     cache_dir = run_dir / "cache"
     run_dir.mkdir(parents=True, exist_ok=True)
