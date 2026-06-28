@@ -225,50 +225,69 @@ def _candidate_capture_ms(start_ms: int, end_ms: int, settings: Settings) -> int
 
 
 def choose_capture_time(video_path: Path, start_ms: int, end_ms: int, settings: Settings, candidates_dir: Path | None = None) -> tuple[int, float]:
+    """在 ASR 段末附近选一张信息量足够的截图。
+
+    策略：
+    1. 默认截图点为 end_ms - capture_margin_ms（保持原行为）。
+    2. 计算默认帧的 edge_density；如果 >= min_edge_density，直接返回。
+    3. 否则在 [default_ms - frame_drift_back_seconds, default_ms] 范围内
+       按 250ms 步长向前（时间更早）搜索，选 edge_density 最高的帧。
+    4. 搜索范围不跨出当前 segment [start_ms, end_ms]。
+    5. 都没找到高密度帧时回退到默认点。
+
+    注：这是轻量优化，只检查最终入选的 slide，不是全段扫描。
+    """
     if end_ms <= start_ms:
         return start_ms, 0.1
-    window_ms = int(settings.stability_window_seconds * 1000)
+
     margin_ms = max(0, int(settings.capture_margin_ms))
-    sample_start = max(start_ms, end_ms - window_ms)
-    sample_end = max(sample_start + 1, end_ms - margin_ms)
-    step_ms = max(100, int(1000 / max(1, settings.refine_fps)))
-    times = list(range(sample_start, sample_end, step_ms))
-    if not times or times[-1] < sample_end:
-        times.append(sample_end)
+    drift_ms = max(0, int(settings.frame_drift_back_seconds * 1000))
+    step_ms = 250  # 250ms 步长，兼顾精度与速度
+
+    default_ms = max(start_ms, end_ms - margin_ms)
+    search_start = max(start_ms, default_ms - drift_ms)
 
     tmp_dir = tempfile.mkdtemp(prefix="videotodoc_frames_")
-    hashes: list[tuple[int, int]] = []
     try:
-        if candidates_dir and candidates_dir.exists():
-            for capture_ms in times:
-                matches = list(candidates_dir.glob(f"candidate_*_{capture_ms}.png"))
+        def _get_frame(ms: int) -> tuple[Path, float]:
+            """获取指定时间帧，优先复用候选图，否则临时精确提取。"""
+            existing = None
+            if candidates_dir and candidates_dir.exists():
+                matches = list(candidates_dir.glob(f"candidate_*_{ms}.png"))
                 if not matches:
-                    matches = list(candidates_dir.glob(f"candidate_{capture_ms}.png"))
+                    matches = list(candidates_dir.glob(f"candidate_{ms}.png"))
                 if matches:
-                    hashes.append((capture_ms, dhash(matches[0])))
+                    existing = matches[0]
 
-        missing_times = [t for t in times if not any(h[0] == t for h in hashes)]
-        for offset, capture_ms in enumerate(missing_times):
-            frame_path = Path(tmp_dir) / f"frame_{start_ms}_{end_ms}_{offset}.png"
-            extract_frame(video_path, capture_ms, frame_path)
-            hashes.append((capture_ms, dhash(frame_path)))
+            if existing:
+                frame_path = existing
+            else:
+                frame_path = Path(tmp_dir) / f"frame_{ms}.png"
+                extract_frame(video_path, ms, frame_path, precise=True)
 
-        hashes.sort()
+            return frame_path, edge_density(frame_path)
+
+        # 默认帧优先
+        _, default_density = _get_frame(default_ms)
+        if default_density >= settings.min_edge_density:
+            return default_ms, min(0.95, 0.5 + default_density * 10)
+
+        # 默认帧信息密度低，向前漂移搜索
+        best_ms = default_ms
+        best_density = default_density
+        for ms in range(default_ms - step_ms, search_start - 1, -step_ms):
+            _, density = _get_frame(ms)
+            if density > best_density:
+                best_ms = ms
+                best_density = density
+                # 找到满足阈值的即可提前结束
+                if density >= settings.min_edge_density:
+                    break
+
+        confidence = min(0.95, 0.5 + best_density * 10)
+        return best_ms, confidence
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    if len(hashes) < 2:
-        return max(start_ms, end_ms - 300), 0.4
-
-    stable_suffix: list[tuple[int, int]] = [hashes[-1]]
-    for current, nxt in zip(reversed(hashes[:-1]), reversed(hashes[1:])):
-        if hamming_distance(current[1], nxt[1]) <= settings.hash_threshold:
-            stable_suffix.append(current)
-        else:
-            break
-    stable_suffix.sort()
-    confidence = min(0.95, 0.45 + len(stable_suffix) / max(1, len(hashes)) * 0.5)
-    return stable_suffix[-1][0], confidence
 
 
 def extract_frame(video_path: Path, capture_ms: int, output_path: Path, precise: bool = True) -> None:
