@@ -18,3 +18,4 @@ tmp/
 *.log
 .tools/
 .venv
+.claude/
