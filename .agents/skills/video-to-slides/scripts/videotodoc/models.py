@@ -81,6 +81,7 @@ class ProcessResult:
     compact_markdown_path: Path | None = None
     semantic_markdown_path: Path | None = None
     mindmap_image_path: Path | None = None
+    mindmap_image_paths: list[Path] = field(default_factory=list)
     docx_path: Path | None = None
     semantic_docx_path: Path | None = None
     quality_report_path: Path | None = None

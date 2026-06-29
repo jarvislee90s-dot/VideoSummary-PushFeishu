@@ -179,9 +179,10 @@ def _process(args: argparse.Namespace) -> int:
 
 
 def _render_mindmap(args: argparse.Namespace) -> int:
-    image_path, refreshed = render_mindmap_and_refresh_docs(args.run_dir, use_mermaid=args.mermaid)
+    image_paths, refreshed = render_mindmap_and_refresh_docs(args.run_dir, use_mermaid=args.mermaid)
     print("思维导图已渲染：")
-    print(f"- image: {image_path}")
+    for image_path in image_paths:
+        print(f"- image: {image_path}")
     for docx_path in refreshed:
         print(f"- refreshed_docx: {docx_path}")
     return 0

@@ -303,8 +303,9 @@ def finalize_video(
                     temp_mindmap.symlink_to(mindmap_path.name)
                 except OSError:
                     shutil.copy2(mindmap_path, temp_mindmap)
-            render_mindmap_and_refresh_docs(run_dir, mindmap_path=mindmap_path, image_path=mindmap_image_path)
-        return mindmap_image_path.exists()
+            image_paths, _ = render_mindmap_and_refresh_docs(run_dir, mindmap_path=mindmap_path, image_path=mindmap_image_path)
+            return image_paths
+        return [mindmap_image_path]
 
     def _render_original_md():
         render_original_markdown(slug, sections, markdown_path)
@@ -312,16 +313,14 @@ def finalize_video(
     with ThreadPoolExecutor(max_workers=3) as executor:
         f_mindmap = executor.submit(_render_mindmap)
         f_orig_md = executor.submit(_render_original_md)
-        f_mindmap.result()
+        mm_images = f_mindmap.result()
         f_orig_md.result()
 
-    mm_image = mindmap_image_path if mindmap_image_path.exists() else None
-
     def _render_compact_md():
-        render_compact_markdown(slug, sections, compact_markdown_path, mm_image)
+        render_compact_markdown(slug, sections, compact_markdown_path, mm_images)
 
     def _render_semantic_md():
-        ensure_semantic_markdown(slug, sections, semantic_markdown_path, mm_image)
+        ensure_semantic_markdown(slug, sections, semantic_markdown_path, mm_images)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         f_compact = executor.submit(_render_compact_md)
@@ -469,8 +468,9 @@ def process_video(
                     temp_mindmap.symlink_to(mindmap_path.name)
                 except OSError:
                     shutil.copy2(mindmap_path, temp_mindmap)
-            render_mindmap_and_refresh_docs(run_dir, mindmap_path=mindmap_path, image_path=mindmap_image_path)
-        return mindmap_image_path.exists()
+            image_paths, _ = render_mindmap_and_refresh_docs(run_dir, mindmap_path=mindmap_path, image_path=mindmap_image_path)
+            return image_paths
+        return [mindmap_image_path]
 
     def _render_original_md_pv():
         render_original_markdown(video_path.stem, sections, markdown_path)
@@ -482,18 +482,16 @@ def process_video(
         f_mindmap_pv = executor.submit(_render_mindmap_pv)
         f_orig_md_pv = executor.submit(_render_original_md_pv)
         f_quality_pv = executor.submit(_write_quality_report_pv)
-        mindmap_ok = f_mindmap_pv.result()
+        mm_images = f_mindmap_pv.result()
         f_orig_md_pv.result()
         f_quality_pv.result()
-
-    mm_image = mindmap_image_path if mindmap_ok else None
 
     def _render_compact_md_pv():
         render_compact_markdown(
             video_path.stem,
             sections,
             compact_markdown_path,
-            mm_image,
+            mm_images,
         )
 
     def _render_semantic_md_pv():
@@ -501,7 +499,7 @@ def process_video(
             video_path.stem,
             sections,
             semantic_markdown_path,
-            mm_image,
+            mm_images,
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -531,7 +529,8 @@ def process_video(
         mindmap_path=mindmap_path,
         compact_markdown_path=compact_markdown_path,
         semantic_markdown_path=semantic_markdown_path,
-        mindmap_image_path=mindmap_image_path if mindmap_image_path.exists() else None,
+        mindmap_image_path=mm_images[0] if mm_images else None,
+        mindmap_image_paths=mm_images,
         docx_path=generated_docx,
         semantic_docx_path=generated_semantic_docx,
         quality_report_path=quality_report_path,

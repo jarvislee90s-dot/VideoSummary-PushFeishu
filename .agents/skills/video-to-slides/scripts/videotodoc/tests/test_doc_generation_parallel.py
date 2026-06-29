@@ -99,6 +99,7 @@ class TestDocGenerationParallel:
         def mock_render_mindmap(rd, mindmap_path=None, image_path=None):
             if image_path:
                 _make_test_image(image_path, (200, 200, 200))
+            return [image_path] if image_path else [], []
 
         def mock_render_orig(title, sections, path):
             path.write_text("# original markdown", encoding="utf-8")
