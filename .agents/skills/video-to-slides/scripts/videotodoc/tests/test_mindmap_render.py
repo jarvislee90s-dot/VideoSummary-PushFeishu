@@ -1,5 +1,6 @@
 import tempfile
 from pathlib import Path
+
 from PIL import Image
 
 from videotodoc.mindmap import _render_mindmap_with_python_from_tree, _parse_mermaid_tree
@@ -12,6 +13,7 @@ SAMPLE = """mindmap
     B
       b1
 """
+
 
 def test_render_creates_png():
     root = _parse_mermaid_tree(SAMPLE)

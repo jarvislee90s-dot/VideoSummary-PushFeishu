@@ -18,7 +18,7 @@ def render_mindmap_and_refresh_docs(
     mindmap_path: Path | None = None,
     image_path: Path | None = None,
     use_mermaid: bool = False,
-) -> tuple[Path, list[Path]]:
+) -> tuple[list[Path], list[Path]]:
     run_dir = run_dir.resolve()
     mindmap_path = mindmap_path or (run_dir / "mindmap.mmd")
     image_path = image_path or (run_dir / "mindmap.png")
@@ -28,21 +28,22 @@ def render_mindmap_and_refresh_docs(
     if use_mermaid:
         mmdc = _find_mmdc()
         _run_mmdc([mmdc, "-i", str(mindmap_path), "-o", str(image_path), "-b", "transparent"])
+        image_paths = [image_path]
     else:
-        _render_mindmap_with_python(mindmap_path, image_path)
+        image_paths = _render_mindmap_multi(mindmap_path, image_path)
 
     refreshed: list[Path] = []
     # 刷新所有 Markdown 和对应的 Word 文件
     for md_file in run_dir.glob("*.md"):
         if "质量报告" in md_file.name:
             continue
-        ensure_mindmap_link(md_file, image_path)
+        ensure_mindmap_link(md_file, image_paths)
         docx_file = md_file.with_suffix(".docx")
         if docx_file.exists():
             generated = markdown_to_docx(md_file, docx_file)
             if generated:
                 refreshed.append(generated)
-    return image_path, refreshed
+    return image_paths, refreshed
 
 
 def _find_mmdc() -> str:
@@ -103,25 +104,49 @@ def _mmdc_env() -> dict[str, str]:
     return env
 
 
-def _render_mindmap_with_python(mindmap_path: Path, image_path: Path) -> None:
+def _render_mindmap_multi(mindmap_path: Path, image_path: Path) -> list[Path]:
     try:
         from PIL import Image, ImageDraw, ImageFont  # type: ignore
     except ModuleNotFoundError as exc:
         raise VideoToDocError("未安装 Pillow，无法使用 Python 渲染器。") from exc
 
+    from .mindmap_layout import LayoutConfig, compute_layout, split_layouts_by_chapters
+    from .mindmap_verify import verify_layout
+
     root = _parse_mermaid_tree(mindmap_path.read_text(encoding="utf-8"))
     if not root:
         raise VideoToDocError(f"mindmap.mmd 没有可渲染节点：{mindmap_path}")
 
-    _render_mindmap_with_python_from_tree(root, image_path)
+    cfg = LayoutConfig()
+    base_layout = compute_layout(root, cfg)
+    issues = verify_layout(base_layout, cfg)
+    if not issues:
+        _render_layout_to_file(base_layout, image_path)
+        return [image_path]
+
+    layouts = split_layouts_by_chapters(root, cfg)
+    paths: list[Path] = []
+    stem = image_path.stem
+    suffix = image_path.suffix
+    parent = image_path.parent
+    for index, layout in enumerate(layouts, start=1):
+        numbered = parent / f"{stem}_{index:02d}{suffix}"
+        _render_layout_to_file(layout, numbered)
+        paths.append(numbered)
+    return paths
 
 
 def _render_mindmap_with_python_from_tree(root: _MindmapNode, image_path: Path) -> None:
-    from PIL import Image, ImageDraw, ImageFont  # type: ignore
-    from .mindmap_layout import LayoutConfig, MindmapLayout, compute_layout
+    from .mindmap_layout import LayoutConfig, compute_layout
 
     cfg = LayoutConfig()
     layout = compute_layout(root, cfg)
+    _render_layout_to_file(layout, image_path)
+
+
+def _render_layout_to_file(layout: MindmapLayout, image_path: Path) -> None:
+    from PIL import Image, ImageDraw, ImageFont  # type: ignore
+
     img = Image.new("RGB", (int(layout.image_width), int(layout.image_height)), "white")
     draw = ImageDraw.Draw(img)
     font_root = _load_font(14)
