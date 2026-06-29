@@ -34,7 +34,7 @@ def render_compact_markdown(
     title: str,
     sections: list[Section],
     output_path: Path,
-    mindmap_image_path: Path | None = None,
+    mindmap_image_path: Path | list[Path] | None = None,
 ) -> Path:
     lines = [f"# {title}", "", "## 图文讲义", ""]
     for index, section in enumerate(sections):
@@ -53,7 +53,11 @@ def render_compact_markdown(
         if index != len(sections) - 1:
             lines.extend(["---", ""])
     if mindmap_image_path:
-        lines.extend(["## 思维导图", "", f"![思维导图]({_markdown_image_path(mindmap_image_path, output_path.parent)})", ""])
+        lines.extend(["## 思维导图", ""])
+        paths = mindmap_image_path if isinstance(mindmap_image_path, list) else [mindmap_image_path]
+        for path in paths:
+            lines.append(f"![思维导图]({_markdown_image_path(path, output_path.parent)})")
+        lines.append("")
     write_text(output_path, "\n".join(lines).rstrip() + "\n")
     return output_path
 
@@ -62,7 +66,7 @@ def ensure_semantic_markdown(
     title: str,
     sections: list[Section],
     output_path: Path,
-    mindmap_image_path: Path | None = None,
+    mindmap_image_path: Path | list[Path] | None = None,
 ) -> Path:
     if output_path.exists():
         return ensure_mindmap_link(output_path, mindmap_image_path)
@@ -87,18 +91,21 @@ def ensure_semantic_markdown(
     return ensure_mindmap_link(output_path, mindmap_image_path)
 
 
-def ensure_mindmap_link(markdown_path: Path, mindmap_image_path: Path | None) -> Path:
+def ensure_mindmap_link(markdown_path: Path, mindmap_image_path: Path | list[Path] | None) -> Path:
     if not mindmap_image_path:
         return markdown_path
-    image_ref = _markdown_image_path(mindmap_image_path, markdown_path.parent)
+    paths = mindmap_image_path if isinstance(mindmap_image_path, list) else [mindmap_image_path]
+    if not paths:
+        return markdown_path
     text = markdown_path.read_text(encoding="utf-8") if markdown_path.exists() else ""
-    replacement = f"![思维导图]({image_ref})"
+    replacements = [f"![思维导图]({_markdown_image_path(p, markdown_path.parent)})" for p in paths]
+    replacement_block = "\n\n".join(replacements)
     if re.search(r"!\[思维导图\]\([^)]+\)", text):
-        text = re.sub(r"!\[思维导图\]\([^)]+\)", replacement, text)
+        text = re.sub(r"(!\[思维导图\]\([^)]+\)\n?\n?)*", replacement_block + "\n", text)
     elif "## 思维导图" in text:
-        text = text.rstrip() + f"\n\n{replacement}\n"
+        text = text.rstrip() + f"\n\n{replacement_block}\n"
     else:
-        text = text.rstrip() + f"\n\n## 思维导图\n\n{replacement}\n"
+        text = text.rstrip() + f"\n\n## 思维导图\n\n{replacement_block}\n"
     write_text(markdown_path, text.rstrip() + "\n")
     return markdown_path
 
