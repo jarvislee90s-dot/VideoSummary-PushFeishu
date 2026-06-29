@@ -1,4 +1,4 @@
-from videotodoc.mindmap_layout import LayoutConfig, LayoutNode, compute_layout
+from videotodoc.mindmap_layout import LayoutConfig, LayoutNode, compute_layout, split_layouts_by_chapters
 from videotodoc.mindmap import _parse_mermaid_tree
 
 LONG_MMD = """mindmap
@@ -85,3 +85,39 @@ def test_single_column_root_on_left():
         assert leaf["height"] == cfg.leaf_h
     expected_width = 2 * cfg.margin_x + cfg.root_w + cfg.root_to_chapter_gap + cfg.chapter_w + cfg.branch_spacing + cfg.leaf_w
     assert abs(layout.image_width - expected_width) < 1
+
+
+SPLIT_MMD = """mindmap
+  root((R))
+    A
+      a1
+    B
+      b1
+    C
+      c1
+    D
+      d1
+"""
+
+
+def test_split_layouts_by_chapters():
+    root = _parse_mermaid_tree(SPLIT_MMD)
+    layouts = split_layouts_by_chapters(root, LayoutConfig(max_chapters_per_image=2))
+    assert len(layouts) == 2
+    first_chapters = [c["text"] for c in layouts[0].chapter_nodes]
+    second_chapters = [c["text"] for c in layouts[1].chapter_nodes]
+    assert first_chapters == ["A", "B"]
+    assert second_chapters == ["C", "D"]
+
+
+def test_split_layouts_single_chapter_returns_single_layout():
+    mmd = """mindmap
+  root((R))
+    A
+      a1
+"""
+    root = _parse_mermaid_tree(mmd)
+    layouts = split_layouts_by_chapters(root, LayoutConfig(max_chapters_per_image=2))
+    assert len(layouts) == 1
+    assert layouts[0].chapter_nodes[0]["text"] == "A"
+

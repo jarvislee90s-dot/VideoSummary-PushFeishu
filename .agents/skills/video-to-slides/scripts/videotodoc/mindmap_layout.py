@@ -19,6 +19,7 @@ class LayoutConfig:
     chapter_gap: int = 40
     col_gap: int = 60
     max_columns: int = 4
+    max_chapters_per_image: int = 4
     root_w: int = 115
     root_h: int = 48
     top_padding: int = 90
@@ -263,3 +264,23 @@ def compute_layout(root: _MindmapNode, cfg: LayoutConfig | None = None) -> Mindm
         beam_y=beam_y,
         column_entries=column_entries,
     )
+
+
+def _clone_root_with_chapters(root: _MindmapNode, chapters: list[_MindmapNode]) -> _MindmapNode:
+    clone = _MindmapNode(root.text, root.level)
+    clone.children = list(chapters)
+    return clone
+
+
+def split_layouts_by_chapters(root: _MindmapNode, cfg: LayoutConfig | None = None) -> list[MindmapLayout]:
+    cfg = cfg or LayoutConfig()
+    chapters = list(root.children)
+    if not chapters:
+        return [compute_layout(root, cfg)]
+    layouts: list[MindmapLayout] = []
+    chunk_size = max(1, cfg.max_chapters_per_image)
+    for start in range(0, len(chapters), chunk_size):
+        chunk = chapters[start : start + chunk_size]
+        sub_root = _clone_root_with_chapters(root, chunk)
+        layouts.append(compute_layout(sub_root, cfg))
+    return layouts
