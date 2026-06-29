@@ -100,12 +100,11 @@ def ensure_mindmap_link(markdown_path: Path, mindmap_image_path: Path | list[Pat
     text = markdown_path.read_text(encoding="utf-8") if markdown_path.exists() else ""
     replacements = [f"![思维导图]({_markdown_image_path(p, markdown_path.parent)})" for p in paths]
     replacement_block = "\n\n".join(replacements)
-    if re.search(r"!\[思维导图\]\([^)]+\)", text):
-        text = re.sub(r"(!\[思维导图\]\([^)]+\)\n?\n?)*", replacement_block + "\n", text)
-    elif "## 思维导图" in text:
-        text = text.rstrip() + f"\n\n{replacement_block}\n"
-    else:
-        text = text.rstrip() + f"\n\n## 思维导图\n\n{replacement_block}\n"
+    # 清除已有思维导图章节和所有图片引用，再整体追加，避免多次更新后重复累积
+    text = re.sub(r"## 思维导图\s*\n?", "", text)
+    text = re.sub(r"!\[思维导图\]\([^)]+\)\s*\n?", "", text)
+    text = text.rstrip()
+    text += f"\n\n## 思维导图\n\n{replacement_block}\n"
     write_text(markdown_path, text.rstrip() + "\n")
     return markdown_path
 
