@@ -37,7 +37,7 @@ def test_render_raises_on_oversized_png(tmp_path: Path):
 
     def fake_run_mmdc(args: list[str]) -> None:
         output_path = Path(args[args.index("-o") + 1])
-        img = Image.new("RGBA", (4000, 100), (255, 255, 255, 0))
+        img = Image.new("RGBA", (9000, 100), (255, 255, 255, 0))
         img.save(output_path)
 
     with patch("videotodoc.mindmap._run_mmdc", side_effect=fake_run_mmdc):

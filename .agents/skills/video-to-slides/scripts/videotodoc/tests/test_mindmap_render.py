@@ -35,7 +35,7 @@ def test_render_uses_tidy_tree_config(tmp_path: Path):
     assert "1. A" in captured[0]
 
 
-def test_render_splits_large_mindmap(tmp_path: Path):
+def test_render_keeps_single_image_for_large_mindmap(tmp_path: Path):
     lines = ["mindmap", "  root((R))"]
     for i in range(30):
         lines.append(f"    Ch{i}")
@@ -47,7 +47,7 @@ def test_render_splits_large_mindmap(tmp_path: Path):
     with patch("videotodoc.mindmap._run_mmdc", side_effect=_fake_mmdc_runner):
         image_paths, _ = render_mindmap_and_refresh_docs(tmp_path)
 
-    assert len(image_paths) >= 2
+    assert len(image_paths) == 1
 
 
 def test_render_refreshes_markdown_and_docx(tmp_path: Path):

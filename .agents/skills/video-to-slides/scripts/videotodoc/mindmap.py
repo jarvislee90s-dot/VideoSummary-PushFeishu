@@ -7,7 +7,7 @@ from pathlib import Path
 from PIL import Image
 
 from .document import ensure_mindmap_link, markdown_to_docx
-from .mindmap_mermaid import add_chapter_numbers, inject_tidy_tree_config, split_mmd_by_chapters
+from .mindmap_mermaid import add_chapter_numbers, inject_tidy_tree_config
 from .utils import VideoToDocError
 
 
@@ -28,22 +28,16 @@ def render_mindmap_and_refresh_docs(
 
     raw_text = mindmap_path.read_text(encoding="utf-8")
     numbered = add_chapter_numbers(raw_text)
-    sub_mmds = split_mmd_by_chapters(numbered)
+    prepared = inject_tidy_tree_config(numbered)
 
-    image_paths: list[Path] = []
-    stem = image_path.stem
-    suffix = image_path.suffix
-    parent = image_path.parent
+    prepared_path = run_dir / "mindmap_prepared.mmd"
+    prepared_path.write_text(prepared, encoding="utf-8")
+
     mmdc = _find_mmdc()
+    _run_mmdc([mmdc, "-i", str(prepared_path), "-o", str(image_path), "-b", "transparent", "-w", "2400"])
+    _verify_png_size(image_path)
 
-    for index, sub_mmd in enumerate(sub_mmds, start=1):
-        prepared = inject_tidy_tree_config(sub_mmd)
-        sub_path = parent / f"{stem}_{index:02d}.mmd"
-        png_path = parent / f"{stem}_{index:02d}{suffix}"
-        sub_path.write_text(prepared, encoding="utf-8")
-        _run_mmdc([mmdc, "-i", str(sub_path), "-o", str(png_path), "-b", "transparent", "-w", "2400"])
-        _verify_png_size(png_path)
-        image_paths.append(png_path)
+    image_paths = [image_path]
 
     refreshed: list[Path] = []
     for md_file in run_dir.glob("*.md"):
@@ -58,7 +52,7 @@ def render_mindmap_and_refresh_docs(
     return image_paths, refreshed
 
 
-def _verify_png_size(png_path: Path, max_size: int = 3000) -> None:
+def _verify_png_size(png_path: Path, max_size: int = 8000) -> None:
     with Image.open(png_path) as img:
         if img.width > max_size or img.height > max_size:
             raise VideoToDocError(
